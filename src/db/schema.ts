@@ -20,6 +20,8 @@ export const documents = pgTable(
     contentType: text("content_type").$type<ContentType>().notNull(),
     // The request the writer agent was given, kept so revisions stay on-brief.
     brief: text("brief").notNull(),
+    // Material the user pasted (PRDs, user stories, notes), passed to the writer verbatim.
+    sourceMaterial: text("source_material"),
     content: text("content").notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
@@ -38,14 +40,25 @@ export const documentRevisions = pgTable("document_revisions", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
-export const chatMessages = pgTable("chat_messages", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  role: text("role").$type<"user" | "assistant">().notNull(),
-  content: text("content").notNull(),
-  // Document the message produced or referred to, so the UI can link to it.
-  documentId: uuid("document_id").references(() => documents.id, { onDelete: "set null" }),
-  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-});
+export type ChatRole = "user" | "assistant" | "event";
+
+export const chatMessages = pgTable(
+  "chat_messages",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    // Every conversation belongs to a document.
+    threadId: uuid("thread_id")
+      .notNull()
+      .references(() => documents.id, { onDelete: "cascade" }),
+    // "event" = a notice shown in the chat (e.g. a Google Doc was read); not sent to the model.
+    role: text("role").$type<ChatRole>().notNull(),
+    content: text("content").notNull(),
+    // Document the message produced or referred to, so the UI can link to it.
+    documentId: uuid("document_id").references(() => documents.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [index("chat_messages_thread_idx").on(t.threadId, t.createdAt)],
+);
 
 export type Document = typeof documents.$inferSelect;
 export type ChatMessage = typeof chatMessages.$inferSelect;

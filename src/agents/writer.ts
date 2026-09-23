@@ -13,6 +13,13 @@ Craft standards:
 - Describe the offer exactly as the brief does. Don't turn a subscription into a waitlist, a launch into a sale, or a free week into a discount.
 - Never invent statistics or testimonials.
 
+Working from source material (PRDs, user stories, notes):
+- It is the only source of facts. Use its specifics — features, numbers, prices, limits, timings — instead of generic claims.
+- Goals, targets, and success metrics are plans, not results. "Cut no-shows by 50%" is a goal; never state it as something the product already does.
+- Never mention features listed as out of scope, future, or not at launch as if they exist.
+- Turn the problem and user stories into the reader's own words: they are the best hooks.
+- Follow any brand or voice notes in it.
+
 Example of the voice — match its rhythm and plain words, not its topic:
 "Most mornings start in a rush. Keys, coffee, the door. You tell yourself you'll slow down tomorrow. Tomorrow comes. It looks like today.
 Big plans don't fix this. Small things do. A bag packed the night before. Ten quiet minutes that belong to you.
@@ -25,7 +32,8 @@ Format:
 const FORMAT_GUIDANCE: Record<ContentType, string> = {
   blog_post: "Blog post: 800–1500 words, a hook intro, H2 sections, and a conclusion with a CTA. Search-friendly headings.",
   landing_page: "Landing page: hero headline + subhead, benefit sections, social-proof placeholders, objection handling, a CTA after the hero and once more at the end (no other CTAs). Label each section with an H2.",
-  website_copy: "Website copy: page-by-page or section-by-section copy with H2 labels for each section, tight and scannable.",
+  website_copy:
+    "Website copy for a marketing homepage, each section labeled with an H2: Hero (headline, one-line subhead, primary CTA button text); The problem (in the reader's words); How it works (3 short steps); Features, written as benefits (group related features, don't just list them); Pricing (if given); FAQ (3–5 real objections, answered); Final CTA. These are section types, not headings: write a real headline for each H2 (never \"Hero\" or \"Features\").",
   email: "Email: provide 3 subject line options and preview text, then the body. Short paragraphs, one CTA.",
   ad_copy: "Ad copy: several variants (headline, primary text, CTA) grouped by H2, respecting typical platform length limits.",
   social_post: "Social posts: several variants grouped by platform under H2s, native to each platform's style and length.",
@@ -39,6 +47,7 @@ export type WriteRequest = {
   audience?: string;
   tone?: string;
   keywords?: string[];
+  sourceMaterial?: string | null;
 };
 
 function describeRequest(req: WriteRequest) {
@@ -49,6 +58,7 @@ function describeRequest(req: WriteRequest) {
     req.audience && `Audience: ${req.audience}`,
     req.tone && `Tone: ${req.tone}`,
     req.keywords?.length && `Keywords to include naturally: ${req.keywords.join(", ")}`,
+    req.sourceMaterial && `Source material from the user (the only source of facts):\n<<<\n${req.sourceMaterial}\n>>>`,
   ]
     .filter(Boolean)
     .join("\n");

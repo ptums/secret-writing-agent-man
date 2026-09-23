@@ -19,11 +19,22 @@ export function DocumentHistory(props: {
   query: string;
   onQueryChange: (q: string) => void;
   onSelect: (id: string) => void;
+  onNew: () => void;
 }) {
   return (
     <aside className="flex min-h-0 flex-col border-r border-line bg-panel">
       <div className="border-b border-line p-4">
-        <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted">Documents</h2>
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-xs font-semibold uppercase tracking-wider text-muted">Documents</h2>
+          <button
+            onClick={props.onNew}
+            aria-label="New document"
+            title="New document"
+            className="flex h-7 w-7 items-center justify-center rounded-md border border-line text-lg leading-none text-muted hover:bg-hover hover:text-foreground"
+          >
+            +
+          </button>
+        </div>
         <input
           type="search"
           value={props.query}
@@ -34,7 +45,7 @@ export function DocumentHistory(props: {
       </div>
       <ul className="min-h-0 flex-1 overflow-y-auto p-2">
         {props.documents.length === 0 && (
-          <li className="p-3 text-sm text-muted">{props.query ? "No matches." : "No documents yet. Ask for one in the chat."}</li>
+          <li className="p-3 text-sm text-muted">{props.query ? "No matches." : "No documents yet. Press + to start one."}</li>
         )}
         {props.documents.map((doc) => (
           <li key={doc.id}>

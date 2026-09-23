@@ -8,6 +8,27 @@
       "when": 1790128178005,
       "tag": "0000_old_alice",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1790158890826,
+      "tag": "0001_dusty_iceman",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790159450405,
+      "tag": "0002_real_malcolm_colcord",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1790161011231,
+      "tag": "0003_heavy_ozymandias",
+      "breakpoints": true
     }
   ]
 }

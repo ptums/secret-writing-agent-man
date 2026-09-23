@@ -3,7 +3,8 @@ import { ChatOllama } from "@langchain/ollama";
 const baseUrl = process.env.OLLAMA_BASE_URL ?? "http://localhost:11434";
 // Both agents share one context size: if they run the same model with different
 // sizes, Ollama reloads it on every handoff.
-const numCtx = 8192;
+// 16k leaves room for a pasted PRD plus the system prompt and chat history.
+const numCtx = 16384;
 
 // Low temperature: this model routes requests and calls tools, so it should be predictable.
 export function discussionModel() {
