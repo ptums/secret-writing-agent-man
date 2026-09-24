@@ -2,7 +2,8 @@ import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import type { ContentType } from "@/db/schema";
 import { writerModel } from "./models";
 
-const SYSTEM_PROMPT = `You are a senior copywriter and content strategist. You write only the deliverable itself — no preamble, no commentary, no "Here is your draft". You are the best writer in existence and everything you write engages the reader deeply.
+// The house style. The editor rewrites with this same prompt, so revisions keep the voice.
+export const SYSTEM_PROMPT = `You are a senior copywriter and content strategist. You write only the deliverable itself — no preamble, no commentary, no "Here is your draft". You are the best writer in existence and everything you write engages the reader deeply.
 
 Craft standards:
 - Lead with the reader's problem or desire, not the product. Every headline earns the next line.
@@ -30,14 +31,19 @@ Format:
 - Use headings, short lists, and bold sparingly to aid scanning.`;
 
 const FORMAT_GUIDANCE: Record<ContentType, string> = {
-  blog_post: "Blog post: 800–1500 words, a hook intro, H2 sections, and a conclusion with a CTA. Search-friendly headings.",
-  landing_page: "Landing page: hero headline + subhead, benefit sections, social-proof placeholders, objection handling, a CTA after the hero and once more at the end (no other CTAs). Label each section with an H2.",
+  blog_post:
+    "Blog post: 800–1500 words, a hook intro, H2 sections, and a conclusion with a CTA. Search-friendly headings.",
+  landing_page:
+    "Landing page: hero headline + subhead, benefit sections, social-proof placeholders, objection handling, a CTA after the hero and once more at the end (no other CTAs). Label each section with an H2.",
   website_copy:
-    "Website copy for a marketing homepage, each section labeled with an H2: Hero (headline, one-line subhead, primary CTA button text); The problem (in the reader's words); How it works (3 short steps); Features, written as benefits (group related features, don't just list them); Pricing (if given); FAQ (3–5 real objections, answered); Final CTA. These are section types, not headings: write a real headline for each H2 (never \"Hero\" or \"Features\").",
+    'Website copy for a marketing homepage, each section labeled with an H2: Hero (headline, one-line subhead, primary CTA button text); The problem (in the reader\'s words); How it works (3 short steps); Features, written as benefits (group related features, don\'t just list them); Pricing (if given); FAQ (3–5 real objections, answered); Final CTA. These are section types, not headings: write a real headline for each H2 (never "Hero" or "Features").',
   email: "Email: provide 3 subject line options and preview text, then the body. Short paragraphs, one CTA.",
-  ad_copy: "Ad copy: several variants (headline, primary text, CTA) grouped by H2, respecting typical platform length limits.",
-  social_post: "Social posts: several variants grouped by platform under H2s, native to each platform's style and length.",
-  campaign_brief: "Campaign brief: objective, audience, key message, supporting points, channels, deliverables, and success metrics.",
+  ad_copy:
+    "Ad copy: several variants (headline, primary text, CTA) grouped by H2, respecting typical platform length limits.",
+  social_post:
+    "Social posts: several variants grouped by platform under H2s, native to each platform's style and length.",
+  campaign_brief:
+    "Campaign brief: objective, audience, key message, supporting points, channels, deliverables, and success metrics.",
   other: "Choose the most effective structure for the request.",
 };
 
@@ -50,7 +56,7 @@ export type WriteRequest = {
   sourceMaterial?: string | null;
 };
 
-function describeRequest(req: WriteRequest) {
+export function describeRequest(req: WriteRequest) {
   return [
     `Content type: ${req.contentType}`,
     FORMAT_GUIDANCE[req.contentType],
@@ -65,21 +71,23 @@ function describeRequest(req: WriteRequest) {
 }
 
 // Some models wrap the whole answer in a ```markdown fence.
-function stripFence(raw: string) {
-  return raw.trim().replace(/^```(?:markdown|md)?\n([\s\S]*?)\n```$/, "$1").trim();
+export function stripFence(raw: string) {
+  return raw
+    .trim()
+    .replace(/^```(?:markdown|md)?\n([\s\S]*?)\n```$/, "$1")
+    .replace(/^<<<\n?|\n?>>>$/g, "") // the markers the editor wraps documents in
+    .trim();
 }
 
-async function run(prompt: string) {
-  const response = await writerModel().invoke([new SystemMessage(SYSTEM_PROMPT), new HumanMessage(prompt)]);
+async function run(prompt: string, temperature?: number) {
+  const response = await writerModel({ temperature }).invoke([
+    new SystemMessage(SYSTEM_PROMPT),
+    new HumanMessage(prompt),
+  ]);
   return stripFence(response.text);
 }
 
+// First drafts only: the editor (./editor.ts) reviews every draft and handles all revisions.
 export function writeContent(req: WriteRequest) {
   return run(`Write the following.\n\n${describeRequest(req)}`);
-}
-
-export function reviseContent(req: WriteRequest, currentContent: string, instructions: string) {
-  return run(
-    `Revise the document below. Apply the revision instructions while keeping everything that already works. Return the complete revised document.\n\nOriginal request:\n${describeRequest(req)}\n\nRevision instructions: ${instructions}\n\nCurrent document:\n${currentContent}`,
-  );
 }

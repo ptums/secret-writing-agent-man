@@ -54,3 +54,6 @@ Thumbs.db
 
 # local Claude Code settings
 .claude/settings.local.json
+
+# local database backups
+/backups

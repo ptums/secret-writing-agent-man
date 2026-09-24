@@ -68,11 +68,12 @@ export async function fetchGoogleDoc(id: string): Promise<FetchedDoc> {
     if (res.ok && type.includes("text/html")) {
       return {
         ok: false,
-        reason: 'it isn\'t shared publicly. In Google Docs, click Share → General access → "Anyone with the link" (Viewer), then paste the link again.',
+        reason:
+          'it isn\'t shared publicly. In Google Docs, click Share → General access → "Anyone with the link" (Viewer), then paste the link again.',
       };
     }
     if (!res.ok) continue; // e.g. the format isn't available; try the next one
-    const text = (await res.text()).replace(/^﻿/, "").trim();
+    const text = (await res.text()).replace(/^\uFEFF/, "").trim(); // strip a leading byte-order mark
     if (!text) return { ok: false, reason: "the document is empty." };
     return { ok: true, title: titleFrom(res.headers.get("content-disposition")) ?? "Untitled Google Doc", text };
   }

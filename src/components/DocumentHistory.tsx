@@ -45,7 +45,9 @@ export function DocumentHistory(props: {
       </div>
       <ul className="min-h-0 flex-1 overflow-y-auto p-2">
         {props.documents.length === 0 && (
-          <li className="p-3 text-sm text-muted">{props.query ? "No matches." : "No documents yet. Press + to start one."}</li>
+          <li className="p-3 text-sm text-muted">
+            {props.query ? "No matches." : "No documents yet. Press + to start one."}
+          </li>
         )}
         {props.documents.map((doc) => (
           <li key={doc.id}>

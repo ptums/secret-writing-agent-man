@@ -19,6 +19,6 @@ export async function PATCH(request: Request, ctx: RouteContext<"/api/documents/
   if (!parsed.success) return Response.json({ error: "Title and content are required" }, { status: 400 });
   if (!(await getDocument(id))) return Response.json({ error: "Not found" }, { status: 404 });
 
-  const doc = await reviseDocument(id, parsed.data, "Manual edit");
+  const doc = await reviseDocument(id, parsed.data, { kind: "manual", instructions: "Manual edit" });
   return Response.json(doc);
 }

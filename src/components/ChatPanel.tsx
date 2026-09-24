@@ -1,9 +1,36 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { CHANGES_HEADER } from "@/lib/changes";
 import type { ChatEntry } from "@/lib/types";
 
 const COLLAPSE_AT = 400;
+
+// The exact before/after lines of a change, computed by the server from the two versions.
+function ChangeList({ text }: { text: string }) {
+  const [header, ...lines] = text.split("\n");
+  return (
+    <div className="rounded-lg border border-line bg-background px-3 py-2 text-xs">
+      <p className="mb-1 font-medium text-muted">{header}</p>
+      <ul className="space-y-1">
+        {lines.map((line, i) => (
+          <li
+            key={i}
+            className={
+              line.startsWith("−")
+                ? "text-red-700 line-through decoration-red-700/40 dark:text-red-400"
+                : line.startsWith("+")
+                  ? "text-green-700 dark:text-green-400"
+                  : "text-muted"
+            }
+          >
+            {line}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
 
 // Pasted PRDs and notes would otherwise fill the whole chat column.
 function MessageText({ text }: { text: string }) {
@@ -67,9 +94,13 @@ export function ChatPanel(props: {
         )}
         {props.messages.map((m) =>
           m.role === "event" ? (
-            <p key={m.id} className="px-1 text-center text-xs text-muted">
-              {m.content}
-            </p>
+            m.content.startsWith(CHANGES_HEADER) ? (
+              <ChangeList key={m.id} text={m.content} />
+            ) : (
+              <p key={m.id} className="px-1 text-center text-xs text-muted">
+                {m.content}
+              </p>
+            )
           ) : (
             <div key={m.id} className={m.role === "user" ? "flex justify-end" : ""}>
               <div

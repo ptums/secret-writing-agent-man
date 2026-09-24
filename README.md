@@ -4,12 +4,13 @@ A private writing studio for marketing content: blog posts, landing pages, websi
 
 ## How it works
 
-Two agents split the work:
+Three agents split the work:
 
 - **Discussion agent.** Talks with you in the chat panel. It finds past documents, opens them, asks clarifying questions, and turns your request into a brief. It never writes copy itself.
-- **Writer agent.** Receives the brief and writes the piece. It follows a fixed set of craft and voice rules and per-format guidance for each content type.
+- **Writer agent.** Writes first drafts from the brief and your sources (PRDs, Google Docs), following the house style in `src/agents/writer.ts`.
+- **Editor agent.** Reviews every draft and makes every revision. It checks facts against your sources, voice, the request, and clean output (`EDITOR_CRITERIA` in `src/agents/editor.ts`). It fixes what fails before you see it. Only work that passes review reaches the reader.
 
-Ask for something new and the discussion agent hands it to the writer. With a document open, ask for changes ("make it shorter", "add a P.S.") and it is revised in place. The previous version is saved as a revision.
+Ask for something new and the discussion agent sends it through the writer and then the editor. With a document open, ask for changes ("make it shorter", "add a P.S.") and the editor revises it in place. Quoted text ("replace X with Y", "drop this") is changed exactly and instantly. Every earlier version is saved.
 
 The interface has three columns:
 
@@ -46,14 +47,15 @@ Set these in `.env.local`:
 | `DATABASE_URL` | — | Postgres connection string |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server |
 | `DISCUSSION_MODEL` | `qwen3:8b` | Chat and routing. Must support tool calling. |
-| `WRITER_MODEL` | `qwen3:8b` | Writes the copy |
+| `WRITER_MODEL` | `qwen3:8b` | Writes first drafts |
+| `EDITOR_MODEL` | `qwen3:8b` | Reviews drafts and makes revisions |
 | `WRITER_THINK` | `false` | Let the writer reason before drafting. Slower. |
 
 Pick models that fit in your GPU memory. On a 16 GB Mac, 8B-class models run well. Larger ones such as `gemma4:26b` fall back to the CPU and take minutes per piece.
 
 ## Customizing the writer
 
-The writer's voice, craft rules, and per-format guidance live in `src/agents/writer.ts` (`SYSTEM_PROMPT` and `FORMAT_GUIDANCE`). Edit them to match your brand.
+The writer's voice, craft rules, and per-format guidance live in `src/agents/writer.ts` (`SYSTEM_PROMPT` and `FORMAT_GUIDANCE`). The editor also uses `SYSTEM_PROMPT` when it rewrites. What the editor holds work to lives in `EDITOR_CRITERIA` (`src/agents/editor.ts`). Its automatic checks (sentence length, reading level, banned words, unsupported numbers, PRD goals and out-of-scope items) and their limits live in `src/agents/editorChecks.ts`.
 
 ## Scripts
 
@@ -68,5 +70,5 @@ The writer's voice, craft rules, and per-format guidance live in `src/agents/wri
 
 ## Known limitations
 
-- Replies aren't streamed. Writing a piece takes about 25 seconds.
-- Small local models sometimes invent specific details (days, numbers, process claims). Check facts before publishing.
+- Replies aren't streamed. A new piece takes 1–2 minutes (draft plus editor review); exact edits take seconds.
+- Small local models sometimes invent specific details (days, numbers, process claims). The editor removes the ones it catches; anything it can't verify is marked `[confirm: …]`. Still check facts before publishing.

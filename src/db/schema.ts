@@ -29,7 +29,9 @@ export const documents = pgTable(
   (t) => [index("documents_updated_at_idx").on(t.updatedAt)],
 );
 
-// Snapshot of a document's content taken before each revision overwrites it.
+export type RevisionKind = "revise" | "edit" | "manual";
+
+// Snapshot of a document's content taken before each change overwrites it.
 export const documentRevisions = pgTable("document_revisions", {
   id: uuid("id").primaryKey().defaultRandom(),
   documentId: uuid("document_id")
@@ -37,6 +39,11 @@ export const documentRevisions = pgTable("document_revisions", {
     .references(() => documents.id, { onDelete: "cascade" }),
   content: text("content").notNull(),
   instructions: text("instructions"),
+  // revise = writer rewrite; edit = exact find/replace done in code; manual = user's own edit.
+  kind: text("kind").$type<RevisionKind>().notNull().default("revise"),
+  // For exact edits. Later rewrites keep `replace` text word for word and don't bring back removed `find` text.
+  find: text("find"),
+  replace: text("replace"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 

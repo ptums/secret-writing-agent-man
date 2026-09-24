@@ -1,15 +1,60 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import ReactMarkdown from "react-markdown";
+import {
+  createElement,
+  isValidElement,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentPropsWithoutRef,
+  type ReactNode,
+} from "react";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { normalizeText } from "@/lib/textEdit";
 import type { DocumentDetail } from "@/lib/types";
 
-const toolbarButton = "shrink-0 rounded-md border border-line px-2.5 py-1 text-xs text-muted hover:bg-hover disabled:opacity-40";
+const toolbarButton =
+  "shrink-0 rounded-md border border-line px-2.5 py-1 text-xs text-muted hover:bg-hover disabled:opacity-40";
+
+function textOf(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(textOf).join("");
+  if (isValidElement(node)) return textOf((node.props as { children?: ReactNode }).children);
+  return "";
+}
+
+const MIN_MATCH = 6;
+const HIGHLIGHT_TAGS = ["p", "li", "h1", "h2", "h3", "h4", "blockquote"] as const;
+
+// Markdown renderers that flash any block whose text matches a line the last change added.
+function highlightComponents(highlights: string[]): Components | undefined {
+  const wanted = highlights.map(normalizeText).filter((h) => h.length >= MIN_MATCH);
+  if (!wanted.length) return undefined;
+  const matches = (children: ReactNode) => {
+    const text = normalizeText(textOf(children));
+    return text.length >= MIN_MATCH && wanted.some((h) => text.includes(h) || h.includes(text));
+  };
+  return Object.fromEntries(
+    HIGHLIGHT_TAGS.map((tag) => {
+      const Block = ({ node, className, ...props }: ComponentPropsWithoutRef<"p"> & { node?: unknown }) => {
+        void node; // react-markdown's AST node; not a DOM attribute
+        return createElement(tag, {
+          ...props,
+          className: matches(props.children) ? `${className ?? ""} flash-change` : className,
+        });
+      };
+      Block.displayName = `Highlight(${tag})`;
+      return [tag, Block];
+    }),
+  ) as Components;
+}
 
 export function DocumentReader(props: {
   document: DocumentDetail | null;
   loading: boolean;
+  highlights: string[];
   onSave: (id: string, title: string, content: string) => Promise<void>;
   onDirtyChange: (dirty: boolean) => void;
 }) {
@@ -29,10 +74,12 @@ export function DocumentReader(props: {
 
 function DocumentView({
   document,
+  highlights,
   onSave,
   onDirtyChange,
 }: {
   document: DocumentDetail;
+  highlights: string[];
   onSave: (id: string, title: string, content: string) => Promise<void>;
   onDirtyChange: (dirty: boolean) => void;
 }) {
@@ -42,6 +89,13 @@ function DocumentView({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const articleRef = useRef<HTMLElement>(null);
+  const components = useMemo(() => highlightComponents(highlights), [highlights]);
+
+  // This view remounts on every new version, so the flash plays once per change.
+  useEffect(() => {
+    articleRef.current?.querySelector(".flash-change")?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, [components]);
 
   const dirty = editing && (title !== document.title || content !== document.content);
   useEffect(() => onDirtyChange(dirty), [dirty, onDirtyChange]);
@@ -161,8 +215,13 @@ function DocumentView({
             />
           </div>
         ) : (
-          <article className="prose prose-lg mx-auto max-w-[68ch] px-6 py-12 font-serif dark:prose-invert prose-headings:font-sans prose-headings:tracking-tight">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{document.content}</ReactMarkdown>
+          <article
+            ref={articleRef}
+            className="prose prose-lg mx-auto max-w-[68ch] px-6 py-12 font-serif dark:prose-invert prose-headings:font-sans prose-headings:tracking-tight"
+          >
+            <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+              {document.content}
+            </ReactMarkdown>
           </article>
         )}
       </div>

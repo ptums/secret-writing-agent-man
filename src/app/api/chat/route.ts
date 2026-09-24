@@ -2,13 +2,8 @@ import { z } from "zod";
 import { runDiscussionTurn } from "@/agents/discussion";
 import { getDocument, recentChatMessages, saveChatMessage, setSourceMaterial } from "@/db/queries";
 import type { Document } from "@/db/schema";
-import {
-  PASTE_MIN_CHARS,
-  fetchGoogleDoc,
-  findGoogleDocLinks,
-  mergeSource,
-  truncateSource,
-} from "@/lib/sources";
+import { PASTE_MIN_CHARS, fetchGoogleDoc, findGoogleDocLinks, mergeSource, truncateSource } from "@/lib/sources";
+import { isQuoteOf } from "@/lib/textEdit";
 
 const Uuid = z.string().uuid();
 const Body = z.object({
@@ -40,13 +35,14 @@ export async function POST(request: Request) {
     const { doc: threadDoc, notices, notes } = await attachSources(doc, message);
     for (const notice of notices) await saveChatMessage(threadId, "event", notice);
 
-    const { reply, documentId } = await runDiscussionTurn({ message, history, threadDoc, notes });
+    const { reply, documentId, changes, highlights } = await runDiscussionTurn({ message, history, threadDoc, notes });
+    for (const change of changes) await saveChatMessage(threadId, "event", change);
     await saveChatMessage(threadId, "assistant", reply, documentId);
-    return Response.json({ reply, documentId, notices });
+    return Response.json({ reply, documentId, notices: [...notices, ...changes], highlights });
   } catch (err) {
     console.error("[chat]", err);
-    const reply = `Something went wrong talking to the model: ${err instanceof Error ? err.message : String(err)}. Is Ollama running?`;
-    return Response.json({ reply, documentId: null, notices: [] }, { status: 502 });
+    const reply = errorReply(err);
+    return Response.json({ reply, documentId: null, notices: [], highlights: [] }, { status: 502 });
   }
 }
 
@@ -75,17 +71,31 @@ async function attachSources(doc: Document, message: string) {
     notes.push(`[Read the linked Google Doc "${fetched.title}" and saved it as source material for the writer.]`);
   }
 
-  // Pasted material: whatever's left once the links are removed, if it's long enough.
+  // Pasted material: whatever's left once the links are removed, if it's long enough
+  // and isn't just a quote of the document ("drop this: <passage>").
   let pasted = message;
   for (const link of links) pasted = pasted.replace(link.url, "");
   pasted = pasted.trim();
-  if (pasted.length >= PASTE_MIN_CHARS) {
+  if (pasted.length >= PASTE_MIN_CHARS && !isQuoteOf(pasted, doc.content)) {
     const { text } = truncateSource(pasted);
     const when = new Date().toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" });
     material = mergeSource(material, { key: `paste:${Date.now()}`, label: `Pasted in chat, ${when}`, text });
-    notices.push(`Saved your pasted text (${pasted.split(/\s+/).length.toLocaleString()} words) to this document's sources.`);
+    notices.push(
+      `Saved your pasted text (${pasted.split(/\s+/).length.toLocaleString()} words) to this document's sources.`,
+    );
   }
 
   const updated = material !== doc.sourceMaterial ? await setSourceMaterial(doc.id, material!) : doc;
   return { doc: updated, notices, notes };
+}
+
+function errorReply(err: unknown) {
+  const message = err instanceof Error ? err.message : String(err);
+  if (/recursion limit/i.test(message)) {
+    return "I got stuck on that request. Could you rephrase it, or quote the exact text you mean?";
+  }
+  if (/fetch failed|ECONNREFUSED|other side closed/i.test(message)) {
+    return "I couldn't reach the local model. Is Ollama running?";
+  }
+  return `Something went wrong: ${message}`;
 }

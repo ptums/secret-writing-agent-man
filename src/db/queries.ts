@@ -1,6 +1,13 @@
-import { desc, eq, sql } from "drizzle-orm";
+import { asc, desc, eq, sql } from "drizzle-orm";
 import { db } from ".";
-import { chatMessages, documentRevisions, documents, type ChatRole, type ContentType } from "./schema";
+import {
+  chatMessages,
+  documentRevisions,
+  documents,
+  type ChatRole,
+  type ContentType,
+  type RevisionKind,
+} from "./schema";
 
 const summaryColumns = {
   id: documents.id,
@@ -87,12 +94,16 @@ export async function setSourceMaterial(id: string, sourceMaterial: string) {
 }
 
 // Snapshots the current content into document_revisions, then applies the update.
-// Used for both agent revisions and manual edits.
-export async function reviseDocument(id: string, update: { content: string; title?: string }, instructions: string) {
+// Used for writer revisions, exact edits, and manual edits.
+export async function reviseDocument(
+  id: string,
+  update: { content: string; title?: string },
+  change: { kind: RevisionKind; instructions: string; find?: string; replace?: string },
+) {
   return db.transaction(async (tx) => {
     const [current] = await tx.select().from(documents).where(eq(documents.id, id));
     if (!current) return null;
-    await tx.insert(documentRevisions).values({ documentId: id, content: current.content, instructions });
+    await tx.insert(documentRevisions).values({ documentId: id, content: current.content, ...change });
     const [doc] = await tx
       .update(documents)
       .set({ ...update, updatedAt: new Date() })
@@ -100,6 +111,19 @@ export async function reviseDocument(id: string, update: { content: string; titl
       .returning();
     return doc;
   });
+}
+
+export function revisionHistory(documentId: string) {
+  return db
+    .select({
+      kind: documentRevisions.kind,
+      instructions: documentRevisions.instructions,
+      find: documentRevisions.find,
+      replace: documentRevisions.replace,
+    })
+    .from(documentRevisions)
+    .where(eq(documentRevisions.documentId, documentId))
+    .orderBy(asc(documentRevisions.createdAt));
 }
 
 export async function recentChatMessages(threadId: string, limit = 20) {
@@ -112,11 +136,6 @@ export async function recentChatMessages(threadId: string, limit = 20) {
   return rows.reverse();
 }
 
-export function saveChatMessage(
-  threadId: string,
-  role: ChatRole,
-  content: string,
-  documentId?: string | null,
-) {
+export function saveChatMessage(threadId: string, role: ChatRole, content: string, documentId?: string | null) {
   return db.insert(chatMessages).values({ threadId, role, content, documentId: documentId ?? null });
 }

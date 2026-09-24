@@ -43,3 +43,17 @@ body {
   color: var(--foreground);
   font-family: var(--font-geist-sans), system-ui, sans-serif;
 }
+
+/* Briefly marks passages a change just added (see DocumentReader). */
+@keyframes flash-change {
+  from {
+    background-color: color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+.flash-change {
+  animation: flash-change 4s ease-out;
+  border-radius: 4px;
+}

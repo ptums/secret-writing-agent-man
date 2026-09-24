@@ -21,6 +21,8 @@ export default function Home() {
   });
   const [pending, setPending] = useState(false);
   const [focusChat, setFocusChat] = useState(0);
+  // Lines the last change added, flashed in the reader.
+  const [highlight, setHighlight] = useState<{ docId: string; texts: string[] } | null>(null);
   // The open document is also the chat thread. Mirrored in a ref so a late reply
   // can tell whether the user has since moved to another thread.
   const threadId = active?.id ?? null;
@@ -128,6 +130,7 @@ export default function Home() {
           : c,
       );
     append({ role: "user", content: message, documentId: null });
+    setHighlight(null);
     setPending(true);
     try {
       const res = await fetch("/api/chat", {
@@ -135,15 +138,18 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message, activeDocumentId: sentFrom }),
       });
-      const { reply, documentId, notices } = (await res.json()) as {
+      const { reply, documentId, notices, highlights } = (await res.json()) as {
         reply: string;
         documentId: string | null;
         notices?: string[];
+        highlights?: string[];
       };
       for (const notice of notices ?? []) append({ role: "event", content: notice, documentId: null });
       append({ role: "assistant", content: reply, documentId });
       if (documentId && threadRef.current === sentFrom) {
         await openDocument(documentId);
+        // After the new version is showing, so the flash lands on the changed text.
+        if (highlights?.length) setHighlight({ docId: documentId, texts: highlights });
       }
       if (documentId) await refreshDocuments(query);
     } catch {
@@ -167,7 +173,13 @@ export default function Home() {
         onSelect={openDocument}
         onNew={newDocument}
       />
-      <DocumentReader document={active} loading={loadingDoc} onSave={saveDocument} onDirtyChange={setDirty} />
+      <DocumentReader
+        document={active}
+        loading={loadingDoc}
+        highlights={highlight && highlight.docId === active?.id ? highlight.texts : []}
+        onSave={saveDocument}
+        onDirtyChange={setDirty}
+      />
       <ChatPanel
         threadId={threadId}
         threadTitle={active?.title ?? null}
