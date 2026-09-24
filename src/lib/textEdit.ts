@@ -122,3 +122,49 @@ export function isQuoteOf(pasted: string, content: string) {
   const quoted = lines.filter((l) => doc.includes(l)).reduce((n, l) => n + l.length, 0);
   return quoted / total >= 0.6;
 }
+
+// Levenshtein distance, for matching the user's typos ("reach" for "real").
+function editDistance(a: string, b: string) {
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let prev = row[0];
+    row[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = row[j];
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = tmp;
+    }
+  }
+  return row[b.length];
+}
+
+const wordsOf = (text: string) => normalizeText(text).toLowerCase().split(" ").filter(Boolean);
+const similarWords = (a: string, b: string) =>
+  a === b || (Math.min(a.length, b.length) >= 3 && editDistance(a, b) <= Math.max(1, Math.floor(b.length / 3)));
+
+// The user quotes phrases loosely: different case, straight quotes, a typo or two
+// ("let's bring reach" for "Let’s bring real"). Returns the exact matching text from
+// `text`, or null if nothing is close enough.
+export function resolvePhrase(text: string, phrase: string) {
+  const found = findSpan(text, phrase);
+  if (found.ok) return text.slice(found.span.start, found.span.end);
+
+  const want = wordsOf(phrase);
+  if (!want.length) return null;
+  const words = [...text.matchAll(/\S+/g)].map((m) => ({ raw: m[0], start: m.index!, norm: wordsOf(m[0])[0] ?? "" }));
+  let best: { score: number; i: number; lastExact: boolean } | null = null;
+  for (let i = 0; i + want.length <= words.length; i++) {
+    const window = words.slice(i, i + want.length);
+    const score = window.filter((w, k) => similarWords(w.norm, want[k])).length;
+    if (!best || score > best.score) best = { score, i, lastExact: window[want.length - 1].norm === want.at(-1) };
+  }
+  if (!best || best.score < Math.ceil(want.length * 0.6)) return null;
+  // A typo in the last word often means the user trailed off mid-phrase ("let's bring reach"
+  // for "Let’s bring real change"), so take the next word too, unless it's filler.
+  let endWord = best.i + want.length - 1;
+  const next = words[endWord + 1];
+  if (!best.lastExact && next && !/^(and|or|to|the|a|an|of|for|in|on|with|your|our)$/.test(next.norm)) endWord++;
+  const start = words[best.i].start;
+  const end = words[endWord].start + words[endWord].raw.length;
+  return text.slice(start, end).replace(/[.,;:!?]+$/, (p) => (/[.,;:!?]$/.test(phrase.trim()) ? p : ""));
+}

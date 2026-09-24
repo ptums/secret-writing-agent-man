@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { CHANGES_HEADER } from "@/lib/changes";
+import { OPTIONS_HEADER, parseOptions } from "@/lib/options";
 import type { ChatEntry } from "@/lib/types";
 
 const COLLAPSE_AT = 400;
@@ -32,6 +33,45 @@ function ChangeList({ text }: { text: string }) {
   );
 }
 
+// Other wordings the editor wrote for a line. "Use" swaps one in; the replaced wording
+// becomes an option, so the user can switch back.
+function OptionList({
+  id,
+  text,
+  onUse,
+}: {
+  id: string;
+  text: string;
+  onUse: (id: string, choice: string) => Promise<void>;
+}) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const parsed = parseOptions(text);
+  if (!parsed) return null;
+  return (
+    <div className="rounded-lg border border-line bg-background px-3 py-2 text-xs">
+      <p className="mb-1.5 font-medium text-muted">Other options</p>
+      <ul className="space-y-1.5">
+        {parsed.options.map((option) => (
+          <li key={option} className="flex items-start justify-between gap-2">
+            <span>{option}</span>
+            <button
+              onClick={async () => {
+                setBusy(option);
+                await onUse(id, option);
+                setBusy(null);
+              }}
+              disabled={busy !== null}
+              className="shrink-0 rounded border border-line px-2 py-0.5 font-medium text-accent hover:bg-hover disabled:opacity-40"
+            >
+              {busy === option ? "…" : "Use"}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 // Pasted PRDs and notes would otherwise fill the whole chat column.
 function MessageText({ text }: { text: string }) {
   const [expanded, setExpanded] = useState(false);
@@ -55,6 +95,7 @@ export function ChatPanel(props: {
   focusKey: number;
   onSend: (message: string) => void;
   onOpenDocument: (id: string) => void;
+  onUseOption: (eventId: string, choice: string) => Promise<void>;
 }) {
   const [draft, setDraft] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
@@ -96,6 +137,8 @@ export function ChatPanel(props: {
           m.role === "event" ? (
             m.content.startsWith(CHANGES_HEADER) ? (
               <ChangeList key={m.id} text={m.content} />
+            ) : m.content.startsWith(OPTIONS_HEADER) ? (
+              <OptionList key={m.id} id={m.id} text={m.content} onUse={props.onUseOption} />
             ) : (
               <p key={m.id} className="px-1 text-center text-xs text-muted">
                 {m.content}

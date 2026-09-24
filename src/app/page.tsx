@@ -74,6 +74,36 @@ export default function Home() {
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
   }, []);
 
+  // "Use" on one of the editor's other wordings for a line: swapped in exactly, instantly.
+  async function useOption(eventId: string, choice: string) {
+    const res = await fetch("/api/chat/options", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ eventId, choice }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setChat((c) => ({
+        ...c,
+        messages: [...c.messages, { id: crypto.randomUUID(), role: "event", content: data.error, documentId: null }],
+      }));
+      return;
+    }
+    const { document, change, optionsEvent, highlights } = data as {
+      document: DocumentDetail;
+      change: ChatEntry;
+      optionsEvent: ChatEntry;
+      highlights: string[];
+    };
+    setChat((c) => ({
+      ...c,
+      messages: [...c.messages.map((m) => (m.id === optionsEvent.id ? optionsEvent : m)), change],
+    }));
+    setActive(document);
+    setHighlight({ docId: document.id, texts: highlights });
+    await refreshDocuments(query);
+  }
+
   async function saveDocument(id: string, title: string, content: string) {
     const res = await fetch(`/api/documents/${id}`, {
       method: "PATCH",
@@ -138,13 +168,15 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message, activeDocumentId: sentFrom }),
       });
-      const { reply, documentId, notices, highlights } = (await res.json()) as {
+      const { reply, documentId, events, highlights } = (await res.json()) as {
         reply: string;
         documentId: string | null;
-        notices?: string[];
+        events?: ChatEntry[];
         highlights?: string[];
       };
-      for (const notice of notices ?? []) append({ role: "event", content: notice, documentId: null });
+      // Saved events keep their real ids: "Use" on an option needs them.
+      for (const e of events ?? [])
+        setChat((c) => (c.threadId === sentFrom ? { ...c, messages: [...c.messages, e] } : c));
       append({ role: "assistant", content: reply, documentId });
       if (documentId && threadRef.current === sentFrom) {
         await openDocument(documentId);
@@ -188,6 +220,7 @@ export default function Home() {
         focusKey={focusChat}
         onSend={send}
         onOpenDocument={openDocument}
+        onUseOption={useOption}
       />
     </div>
   );

@@ -1,4 +1,4 @@
-# Writer Agent
+# Secret Writing Agent Man
 
 A private writing studio for marketing content: blog posts, landing pages, website copy, emails, ads, social posts, and campaign briefs. Everything runs locally: the models run on [Ollama](https://ollama.com), and every document is saved in Postgres.
 
@@ -10,7 +10,7 @@ Three agents split the work:
 - **Writer agent.** Writes first drafts from the brief and your sources (PRDs, Google Docs), following the house style in `src/agents/writer.ts`.
 - **Editor agent.** Reviews every draft and makes every revision. It checks facts against your sources, voice, the request, and clean output (`EDITOR_CRITERIA` in `src/agents/editor.ts`). It fixes what fails before you see it. Only work that passes review reaches the reader.
 
-Ask for something new and the discussion agent sends it through the writer and then the editor. With a document open, ask for changes ("make it shorter", "add a P.S.") and the editor revises it in place. Quoted text ("replace X with Y", "drop this") is changed exactly and instantly. Every earlier version is saved.
+Ask for something new and the discussion agent sends it through the writer and then the editor. With a document open, ask for changes ("make it shorter", "add a P.S.") and the editor revises it in place. Quoted text ("replace X with Y", "drop this") is changed exactly and instantly. To reword a line, quote it and say what you want: "keep 'We listen.', I don't like the rest", or mark the part to change like `We listen. <something about real change>`. The editor applies its best wording and offers other options with a **Use** button. Every earlier version is saved.
 
 The interface has three columns:
 

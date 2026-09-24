@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A local writing studio for marketing content (blog posts, landing pages, emails, ads, social). Two LangChain agents run against local Ollama models; documents and chat history live in Postgres. The UI is a single page with three columns: document history (25%), reading pane (50%), and chat with the discussion agent (25%).
+**Secret Writing Agent Man** is a local writing studio for marketing content (blog posts, landing pages, emails, ads, social). Two LangChain agents run against local Ollama models; documents and chat history live in Postgres. The UI is a single page with three columns: document history (25%), reading pane (50%), and chat with the discussion agent (25%).
 
 ## Commands
 
@@ -39,6 +39,21 @@ Config comes from `.env.local` (see `.env.example`): `DATABASE_URL`, `OLLAMA_BAS
 **Every chat belongs to a document.** `chat_messages.thread_id` (NOT NULL) is the document the conversation belongs to. The open document *is* the thread: the client sends it as `activeDocumentId`, and the agent sees only that thread's history (last 20 messages; long ones truncated) and that document's source material, so PRDs from different documents never mix. On load, the UI opens the most recently updated document. Typing with no document open, or pressing "+", creates a blank one (`createBlankDocument`). The first `create_content` in a thread fills the blank document in place (`fillDocument`). Later ones create a new document, copy the source material onto it, and seed its thread with a "Created from …" message. The server appends a note about the thread's document to the *current user message* (not the system prompt). Messages with role `event` are notices for the user (e.g. "Read Google Doc …") and are not sent to the model.
 
 **Source material** (`src/lib/sources.ts`, attached in `/api/chat` before the agent runs) is stored on `documents.source_material` as labeled `===== SOURCE key | label =====` sections. Google Doc links in a message are fetched in code via the public export endpoint (`/export?format=md`, falling back to `txt`), which works only for docs shared as "Anyone with the link". Private docs come back as an HTML sign-in page and are reported to the user. A re-fetched doc replaces its old section. Whatever remains of the message after removing links, if 400+ characters, is saved as a "pasted" section. Fetching happens in code rather than through a tool because small models are unreliable at deciding to call one. Each source is capped at 40k characters to fit the writer's 16k-token context.
+
+**Choosing how to change text** (the discussion agent's tools):
+- `edit_text` is only for the user's exact new words. Code refuses a replacement containing words that aren't in the user's message or the replaced text (`isUsersWording`). The router used to "reword" lines itself through this tool; its lines were weak and got saved as the user's own words.
+- `reword_text` is for rewording one line ("reword this", "keep X, I don't like the rest", `<…>` directions, "suggest another"). The editor's `rewordText` writes several options and code validates each one:
+  - keep phrases present (typos resolved by `resolvePhrase`; only phrases from the line or the user's message count)
+  - drop phrases absent
+  - not a version the user already moved away from
+  - the rest actually reworked
+  - no copying of the user's `<…>` note
+  - parallel list steps ("We listen / We plan") keep their step name
+  - the sentence and fact checks pass
+
+  When the keep phrases sit at the start or end of the line, the model only fills a blank (`template`/`assemble`). qwen3:8b echoed the line or pasted the user's notes when asked to rewrite it "keeping X". The best option is applied; the others are saved as an "Other options:" chat event (`src/lib/options.ts`) with **Use** buttons (`/api/chat/options`, an exact swap recorded as `edit`).
+- `revise_document` is for broad changes and gets the user's own words appended to its instructions.
+- The target line for a reword is resolved in code (`resolveTarget`): text the user quoted or pasted that exists in the document wins over the model's pick, and the most recent change is the fallback. The model picked wrong lines in testing. A note under each message tells the agent the most recently changed line, so "this bullet" works.
 
 **Three ways a document changes**, each recorded in `document_revisions` with a `kind`:
 - `edit`: the `edit_text` tool does an exact find/replace **in code** (`src/lib/textEdit.ts`). It's used whenever the user quotes text. Matching tolerates what copying from the rendered reader changes: curly vs straight quotes, dashes, line breaks, and Markdown markers. It refuses to guess when a quote matches twice. It's instant and touches nothing else, so prefer it over rewrites.

@@ -136,6 +136,21 @@ export async function recentChatMessages(threadId: string, limit = 20) {
   return rows.reverse();
 }
 
-export function saveChatMessage(threadId: string, role: ChatRole, content: string, documentId?: string | null) {
-  return db.insert(chatMessages).values({ threadId, role, content, documentId: documentId ?? null });
+export async function saveChatMessage(threadId: string, role: ChatRole, content: string, documentId?: string | null) {
+  const [row] = await db
+    .insert(chatMessages)
+    .values({ threadId, role, content, documentId: documentId ?? null })
+    .returning();
+  return row;
+}
+
+export async function getChatMessage(id: string) {
+  if (!UUID.test(id)) return null;
+  const [row] = await db.select().from(chatMessages).where(eq(chatMessages.id, id));
+  return row ?? null;
+}
+
+export async function updateChatMessage(id: string, content: string) {
+  const [row] = await db.update(chatMessages).set({ content }).where(eq(chatMessages.id, id)).returning();
+  return row;
 }

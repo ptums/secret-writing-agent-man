@@ -1,7 +1,16 @@
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { z } from "zod";
-import { applyEdit, normalizeText } from "@/lib/textEdit";
-import { LITERAL_HEADINGS, readSourceRules, runChecks, unsupportedSpecifics, type Finding } from "./editorChecks";
+import { applyEdit, findSpan, normalizeText, resolvePhrase } from "@/lib/textEdit";
+import {
+  BANNED_PHRASES,
+  LITERAL_HEADINGS,
+  MAX_SENTENCE_WORDS,
+  readSourceRules,
+  runChecks,
+  sentences,
+  unsupportedSpecifics,
+  type Finding,
+} from "./editorChecks";
 import { editorModel } from "./models";
 import { describeRequest, stripFence, type WriteRequest } from "./writer";
 
@@ -244,4 +253,190 @@ async function rewriteBySection(content: string, instructions: string) {
     rewritten.push(out && headingCount(out) <= headingCount(section) ? out : section);
   }
   return rewritten.join("\n\n");
+}
+
+// ---- Rewording one line -------------------------------------------------------------
+//
+// "Reword this bullet", "keep X, I don't like the rest", "We listen. <real change vibes>".
+// The editor writes several options for just that line; code checks each against what the
+// user asked for, applies the best, and the rest are offered in the chat to swap in.
+
+const wordsIn = (t: string) =>
+  normalizeText(t)
+    .toLowerCase()
+    .match(/[a-z0-9’']+/g) ?? [];
+const escapeRegExp = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+export type RewordSpec = {
+  keep: string[]; // phrases to keep word for word (as the user typed them; typos allowed)
+  drop: string[]; // phrases that must go
+  direction: string; // what the new wording should convey, in the user's words
+  userWords: string; // the user's whole message, verbatim
+  avoid: string[]; // earlier versions of this line the user already moved away from
+};
+
+const OPTIONS = 5;
+const Options = z.object({ options: z.array(z.string()) });
+
+const VOICE = EDITOR_CRITERIA.split("\n")
+  .find((l) => l.startsWith("2. Voice"))
+  ?.replace("2. Voice. ", "");
+
+const REWORD_PROMPT = `You are a copy editor rewording one line of a larger piece. Write ${OPTIONS} distinct options for the line that do what the user asked. Change the wording the user wants changed; don't only add words to the old line. Keep what the line is (its step in a list, its subject, its job on the page) unless the user asks to change that. Voice: ${VOICE}
+Each option is the complete new line as plain text: no quotes, labels, or brackets.`;
+
+const FILL_PROMPT = `You are a copy editor finishing one line of a larger piece. Part of the line is fixed and the user wants to keep it; you write only the missing part, marked ___. Write ${OPTIONS} distinct options for the missing part that do what the user asked. An option may be empty if the fixed part already works as a whole line. Keep what the line is (its step in a list, its subject, its job on the page). Voice: ${VOICE}
+Each option is only the text that replaces ___, as plain text: no quotes, labels, or brackets.`;
+
+// When the kept phrases sit at the start and/or end of the line, the model only writes
+// the middle. qwen3:8b echoed the whole line or copied the user's notes when asked to
+// rewrite it "keeping X"; filling one blank it does well, and the kept text can't drift.
+function template(line: string, keep: string[]) {
+  const spans = keep
+    .map((k) => findSpan(line, k))
+    .flatMap((f) => (f.ok ? [f.span] : []))
+    .sort((a, b) => a.start - b.start);
+  if (!spans.length) return null;
+  const gap = (a: number, b: number) => /^[\s.,;:!?—–-]*$/.test(line.slice(a, b));
+  let prefixEnd = 0;
+  let i = 0;
+  while (i < spans.length && gap(prefixEnd, spans[i].start)) prefixEnd = spans[i++].end;
+  let suffixStart = line.length;
+  let j = spans.length - 1;
+  while (j >= i && gap(spans[j].end, suffixStart)) suffixStart = spans[j--].start;
+  if (j >= i) return null; // a kept phrase sits in the middle: use whole-line mode
+  const prefix = line.slice(0, prefixEnd).trimEnd();
+  const suffix = line.slice(suffixStart).trimStart();
+  return { prefix, suffix, removed: line.slice(prefixEnd, suffixStart).trim() };
+}
+
+export function assemble(t: { prefix: string; suffix: string }, fill: string) {
+  let middle = fill.trim().replace(/^___\s*|\s*___$/g, "");
+  // The model sometimes writes the whole line instead of just the blank.
+  const lead = t.prefix && findSpan(middle, t.prefix);
+  if (lead && lead.ok && lead.span.start === 0) middle = middle.slice(lead.span.end).trim();
+  const tail = t.suffix && findSpan(middle, t.suffix);
+  if (tail && tail.ok && tail.span.end === middle.length) middle = middle.slice(0, tail.span.start).trim();
+  let out = [t.prefix, middle, t.suffix].filter(Boolean).join(" ");
+  if (!t.suffix && !/[.!?]$/.test(out)) out += ".";
+  return out.replace(/\s+([.,;:!?])/g, "$1");
+}
+
+export async function rewordText(
+  line: string,
+  surroundings: { before: string; after: string },
+  spec: RewordSpec,
+  ctx: EditorContext,
+): Promise<{ ok: true; best: string; alternatives: string[] } | { ok: false; reason: string }> {
+  // Resolve loosely-typed phrases to the line's actual wording; a keep phrase that isn't in
+  // the line but is in the user's message (new words they want) is kept as typed.
+  // A phrase must come from the line or from the user's own message. In testing, the model
+  // passed "keep" phrases from a neighbouring bullet and they were forced into this line.
+  const fromUser = (p: string) => normalizeText(spec.userWords).toLowerCase().includes(normalizeText(p).toLowerCase());
+  const resolve = (phrases: string[]) =>
+    phrases.map((p) => resolvePhrase(line, p) ?? (fromUser(p) ? p.trim() : "")).filter(Boolean);
+  // The quoted target line itself isn't a "keep" phrase: keeping all of it leaves nothing
+  // to reword, and the model could only append ("We plan it with you. We craft with you.").
+  const isWholeLine = (p: string) =>
+    normalizeText(p).toLowerCase().length >= normalizeText(line).toLowerCase().length * 0.9;
+  const keep = resolve(spec.keep).filter((k) => !isWholeLine(k));
+  const drop = resolve(spec.drop);
+  const allowed = [checkContext(ctx).allowedText, line, spec.userWords].join("\n");
+  const has = (text: string, phrase: string) =>
+    normalizeText(text).toLowerCase().includes(normalizeText(phrase).toLowerCase());
+  const avoid = [line, ...spec.avoid].map((a) => normalizeText(a).toLowerCase());
+  // "<real change vibes>" describes the new wording; it isn't the wording. The model gets it
+  // as a plain instruction, and options that copy it are rejected.
+  const directions = [...spec.userWords.matchAll(/<([^>]+)>/g)].map((m) => m[1].trim()).filter((d) => d.length > 3);
+  const userWords = spec.userWords.replace(/<([^>]+)>/g, "(new wording that conveys: $1)");
+  // With keep phrases given, "the rest" is what the user wants changed.
+  const contentWords = (t: string) => wordsIn(t).filter((w) => w.length >= 4);
+  const rest = contentWords(
+    keep.reduce((t, k) => t.replace(new RegExp(escapeRegExp(normalizeText(k)), "i"), " "), normalizeText(line)),
+  );
+  const fill = template(line, keep);
+  // Parallel list items ("We listen / We plan / We build"): when the neighbours share the
+  // first word but not the second, the first two words name the step and must stay.
+  const lead = (t: string) => wordsIn(t.replace(/^\s*(?:[-*+•]|\d+[.)])\s+/, "")).slice(0, 2);
+  const [w1, w2] = lead(line);
+  const neighbours = [surroundings.before, surroundings.after].map(lead).filter((n) => n.length === 2);
+  const stepName =
+    w1 && w2 && neighbours.length && neighbours.every(([n1, n2]) => n1 === w1 && n2 !== w2) ? `${w1} ${w2}` : null;
+
+  const problemsWith = (option: string) => {
+    const problems: string[] = [];
+    for (const k of keep) {
+      if (!has(option, k)) problems.push(`must keep "${k}"`);
+      else if (normalizeText(option).toLowerCase().split(normalizeText(k).toLowerCase()).length > 2)
+        problems.push(`repeats "${k}"`);
+    }
+    for (const d of drop) if (has(option, d)) problems.push(`must not contain "${d}"`);
+    if (avoid.includes(normalizeText(option).toLowerCase()))
+      problems.push("repeats a version the user already rejected");
+    for (const d of directions) if (has(option, d)) problems.push("copies the user's note instead of writing copy");
+    if (/\b(I want|I'd like|vibes?)\b/i.test(option) && !/\b(I want|I'd like|vibes?)\b/i.test(line)) {
+      problems.push("uses the user's phrasing instead of copy");
+    }
+    if (keep.length && rest.length >= 2) {
+      const optionWords = new Set(contentWords(option));
+      if (rest.filter((w) => optionWords.has(w)).length / rest.length > 0.5) problems.push("the rest wasn't reworked");
+    }
+    if (/<\/?[a-z][^>]*>|[<>_]{1,3}/i.test(option)) problems.push("contains markup or a blank");
+    if (stepName && lead(option).join(" ") !== stepName)
+      problems.push(`must start with "${stepName}", the step it names`);
+    if (option.includes("\n") && !line.includes("\n")) problems.push("must be a single line");
+    if (sentences(option).some((s) => s.split(/\s+/).length > MAX_SENTENCE_WORDS))
+      problems.push("a sentence is too long");
+    const lower = option.toLowerCase().replace(/’/g, "'");
+    const banned = BANNED_PHRASES.find((b) => lower.includes(b));
+    if (banned) problems.push(`uses filler "${banned}"`);
+    const unsupported = unsupportedSpecifics(option, allowed);
+    if (unsupported.length) problems.push(`adds unsupported ${unsupported.join(", ")}`);
+    return problems;
+  };
+
+  const request = (extra: string) =>
+    [
+      `The piece: ${ctx.request.contentType}. ${ctx.request.brief}`,
+      surroundings.before && `Line before: ${surroundings.before}`,
+      fill
+        ? `The line: ${[fill.prefix, "___", fill.suffix].filter(Boolean).join(" ")}\nIt currently reads: ${line}`
+        : `The line to reword: ${line}`,
+      surroundings.after && `Line after: ${surroundings.after}`,
+      `The user asked: ${userWords}`,
+      `What the new wording should convey: ${spec.direction}`,
+      !fill && keep.length && `Keep word for word: ${keep.map((k) => `"${k}"`).join(", ")}`,
+      drop.length && `Leave out: ${drop.map((d) => `"${d}"`).join(", ")}`,
+      spec.avoid.length && `Versions the user already moved away from: ${spec.avoid.map((a) => `"${a}"`).join("; ")}`,
+      extra,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+  const valid: string[] = [];
+  let feedback = "";
+  for (const temperature of [0.8, 1.0, 1.1]) {
+    const { options } = await editorModel({ temperature })
+      .withStructuredOutput(Options)
+      .invoke([new SystemMessage(fill ? FILL_PROMPT : REWORD_PROMPT), new HumanMessage(request(feedback))]);
+    const reasons = new Set<string>();
+    for (const raw of options) {
+      const text = raw.trim().replace(/^["“]|["”]$/g, "");
+      const option = fill ? assemble(fill, text) : text;
+      const problems = problemsWith(option);
+      problems.forEach((p) => reasons.add(p));
+      if (!problems.length && !valid.some((v) => normalizeText(v) === normalizeText(option))) valid.push(option);
+    }
+    console.info(`[editor] reword (${fill ? "fill" : "line"}): ${options.length} options, ${valid.length} valid`);
+    if (valid.length >= 2) break;
+    // Reasons only, not the rejected options: quoting them back made the model repeat them.
+    feedback = reasons.size ? `Avoid these problems from the last attempt: ${[...reasons].join("; ")}.` : "";
+  }
+  if (!valid.length) {
+    return {
+      ok: false,
+      reason: `No option met the request (keep ${keep.join(", ") || "nothing"}; leave out ${drop.join(", ") || "nothing"}).`,
+    };
+  }
+  return { ok: true, best: valid[0], alternatives: valid.slice(1, 3) };
 }

@@ -8,7 +8,7 @@ const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"]
 const sourceSerif = Source_Serif_4({ variable: "--font-serif-reading", subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "Writer Agent",
+  title: "Secret Writing Agent Man",
   description: "A writing studio powered by local agents",
 };
 

@@ -3,6 +3,7 @@ import { runDiscussionTurn } from "@/agents/discussion";
 import { getDocument, recentChatMessages, saveChatMessage, setSourceMaterial } from "@/db/queries";
 import type { Document } from "@/db/schema";
 import { PASTE_MIN_CHARS, fetchGoogleDoc, findGoogleDocLinks, mergeSource, truncateSource } from "@/lib/sources";
+import { formatOptions } from "@/lib/options";
 import { isQuoteOf } from "@/lib/textEdit";
 
 const Uuid = z.string().uuid();
@@ -33,16 +34,24 @@ export async function POST(request: Request) {
     // Sources are attached in code, before the model runs: small models are
     // unreliable at deciding to call a "fetch this link" tool themselves.
     const { doc: threadDoc, notices, notes } = await attachSources(doc, message);
-    for (const notice of notices) await saveChatMessage(threadId, "event", notice);
+    // Saved rows (with ids) go back to the client: option events need them for "Use".
+    const events = [];
+    for (const notice of notices) events.push(await saveChatMessage(threadId, "event", notice));
 
-    const { reply, documentId, changes, highlights } = await runDiscussionTurn({ message, history, threadDoc, notes });
-    for (const change of changes) await saveChatMessage(threadId, "event", change);
-    await saveChatMessage(threadId, "assistant", reply, documentId);
-    return Response.json({ reply, documentId, notices: [...notices, ...changes], highlights });
+    const turn = await runDiscussionTurn({ message, history, threadDoc, notes });
+    for (const change of turn.changes) events.push(await saveChatMessage(threadId, "event", change));
+    for (const options of turn.options) events.push(await saveChatMessage(threadId, "event", formatOptions(options)));
+    await saveChatMessage(threadId, "assistant", turn.reply, turn.documentId);
+    return Response.json({
+      reply: turn.reply,
+      documentId: turn.documentId,
+      events,
+      highlights: turn.highlights,
+    });
   } catch (err) {
     console.error("[chat]", err);
     const reply = errorReply(err);
-    return Response.json({ reply, documentId: null, notices: [], highlights: [] }, { status: 502 });
+    return Response.json({ reply, documentId: null, events: [], highlights: [] }, { status: 502 });
   }
 }
 
