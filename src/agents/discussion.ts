@@ -15,6 +15,7 @@ import {
 } from "@/db/queries";
 import { CONTENT_TYPES, type ChatMessage, type Document } from "@/db/schema";
 import { CHANGES_HEADER, summarizeChanges } from "@/lib/changes";
+import { quotedPreferences } from "@/lib/intent";
 import type { LineOptions } from "@/lib/options";
 import { applyEdit, findSpan, normalizeText } from "@/lib/textEdit";
 import { discussionModel } from "./models";
@@ -338,11 +339,20 @@ function buildTools(state: TurnState, thread: { doc: Document; userMessage: stri
           .split("|")
           .map((t) => t.trim().replace(/^["“']|["”']$/g, ""))
           .filter(Boolean);
+      // What the user said to keep or drop, read from their own wording, wins over the
+      // model's extraction (which got it backwards in testing).
+      const said = quotedPreferences(thread.userMessage);
+      const same = (a: string, b: string) => normalizeText(a).toLowerCase() === normalizeText(b).toLowerCase();
+      // When the user named phrases to keep, those are the whole list: the model once added
+      // their entire pasted line as a "keep", which left nothing to reword.
+      const keepList = said.keep.length ? said.keep : split(keep);
+      const dropList = [...said.drop, ...split(drop).filter((d) => !said.keep.some((k) => same(k, d)))];
+      console.info("[reword]", JSON.stringify({ line, keep: keepList, drop: dropList, direction }));
 
       const result = await rewordText(
         line,
         surroundings,
-        { keep: split(keep), drop: split(drop), direction, userWords: thread.userMessage, avoid },
+        { keep: keepList, drop: dropList, direction, userWords: thread.userMessage, avoid },
         {
           request: { contentType: current.contentType, brief: current.brief, sourceMaterial: current.sourceMaterial },
           guidance: await standingGuidance(current),
@@ -355,14 +365,8 @@ function buildTools(state: TurnState, thread: { doc: Document; userMessage: stri
       const content = current.content.slice(0, start) + result.best + current.content.slice(end);
       const instructions = [
         `Reword "${line}"`,
-        keep &&
-          `keeping ${split(keep)
-            .map((k) => `"${k}"`)
-            .join(", ")}`,
-        drop &&
-          `leaving out ${split(drop)
-            .map((d) => `"${d}"`)
-            .join(", ")}`,
+        keepList.length && `keeping ${keepList.map((k) => `"${k}"`).join(", ")}`,
+        dropList.length && `leaving out ${dropList.map((d) => `"${d}"`).join(", ")}`,
         `aim: ${direction}`,
       ]
         .filter(Boolean)
@@ -474,6 +478,22 @@ function lastChangeNote(history: ChatMessage[]) {
   ];
 }
 
+// A quoted fragment ("drop 'to your practice…'") means rework its whole line, not just the
+// fragment: rewording only the fragment produced "…real change 2. We plan it together." in
+// testing. Long paragraphs keep the fragment's span.
+const MAX_LINE_CHARS = 240;
+
+function toWholeLine(content: string, span: { start: number; end: number }) {
+  const lineStart = content.lastIndexOf("\n", span.start - 1) + 1;
+  const nl = content.indexOf("\n", span.end);
+  const lineEnd = nl === -1 ? content.length : nl;
+  const raw = content.slice(lineStart, lineEnd);
+  if (raw.length > MAX_LINE_CHARS) return span;
+  // Leave list markers, heading hashes, and trailing spaces outside the span.
+  const marker = raw.match(/^\s*(?:[-*+•]\s+|\d+[.)]\s+|#{1,6}\s+|>\s?)?/)?.[0].length ?? 0;
+  return { start: lineStart + marker, end: lineStart + raw.trimEnd().length };
+}
+
 // Which text a reword is about. Decided in code, because the model picked wrong in testing:
 // it targeted "We listen. <real change vibes>" (not in the document) instead of the quoted
 // line above it, and reworded the last-changed line when the user had quoted another one.
@@ -486,7 +506,8 @@ function resolveTarget(content: string, find: string, userMessage: string, histo
   ]
     .map((q) => q.trim())
     .filter((q) => findSpan(content, q).ok);
-  const modelChoice = findSpan(content, find);
+  const found = findSpan(content, find);
+  const modelChoice = found.ok ? { ...found, span: toWholeLine(content, found.span) } : found;
   const overlaps = (q: string) => {
     const a = normalizeText(q).toLowerCase();
     const b = normalizeText(find).toLowerCase();
@@ -496,14 +517,14 @@ function resolveTarget(content: string, find: string, userMessage: string, histo
   if (modelChoice.ok && (quoted.length === 0 || quoted.some(overlaps))) return modelChoice;
   if (quoted.length) {
     // Prefer a whole quoted line over a fragment of it.
-    const best = quoted.sort((a, b) => b.length - a.length)[0];
-    return findSpan(content, best);
+    const best = findSpan(content, quoted.sort((a, b) => b.length - a.length)[0]);
+    return best.ok ? { ...best, span: toWholeLine(content, best.span) } : best;
   }
   if (modelChoice.ok) return modelChoice;
   const last = recentChanges(history).at(-1);
   if (last?.added.length === 1) {
     const recent = findSpan(content, last.added[0]);
-    if (recent.ok) return recent;
+    if (recent.ok) return { ...recent, span: toWholeLine(content, recent.span) };
   }
   return modelChoice;
 }

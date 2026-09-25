@@ -317,6 +317,12 @@ export function assemble(t: { prefix: string; suffix: string }, fill: string) {
   if (lead && lead.ok && lead.span.start === 0) middle = middle.slice(lead.span.end).trim();
   const tail = t.suffix && findSpan(middle, t.suffix);
   if (tail && tail.ok && tail.span.end === middle.length) middle = middle.slice(0, tail.span.start).trim();
+  // After a finished sentence ("We listen."), the fill starts a new one: drop a dangling
+  // "and"/"but"/"so" and capitalize ("We listen. and let's…" came back in testing).
+  if (/[.!?]$/.test(t.prefix) && middle) {
+    middle = middle.replace(/^(and|but|so|or)\s+/i, "");
+    middle = middle.charAt(0).toUpperCase() + middle.slice(1);
+  }
   let out = [t.prefix, middle, t.suffix].filter(Boolean).join(" ");
   if (!t.suffix && !/[.!?]$/.test(out)) out += ".";
   return out.replace(/\s+([.,;:!?])/g, "$1");
@@ -330,17 +336,27 @@ export async function rewordText(
 ): Promise<{ ok: true; best: string; alternatives: string[] } | { ok: false; reason: string }> {
   // Resolve loosely-typed phrases to the line's actual wording; a keep phrase that isn't in
   // the line but is in the user's message (new words they want) is kept as typed.
-  // A phrase must come from the line or from the user's own message. In testing, the model
-  // passed "keep" phrases from a neighbouring bullet and they were forced into this line.
+  // Keep/drop phrases refer to existing text, so they're matched loosely (typos) against the
+  // line, then against its earlier versions. An unmatched keep phrase is only used as new
+  // wording if the user asked to add or include words; otherwise a typo like "let's bring
+  // reach" would be pasted into the copy. Phrases the model invented (not in the user's
+  // message) are ignored: in testing it passed phrases from a neighbouring bullet.
   const fromUser = (p: string) => normalizeText(spec.userWords).toLowerCase().includes(normalizeText(p).toLowerCase());
-  const resolve = (phrases: string[]) =>
-    phrases.map((p) => resolvePhrase(line, p) ?? (fromUser(p) ? p.trim() : "")).filter(Boolean);
+  const asksToAdd = /\b(add|include|use the words?|mention|work in|put in)\b/i.test(spec.userWords);
+  const resolveKeep = (p: string) => {
+    const inLine = resolvePhrase(line, p);
+    if (inLine) return inLine;
+    for (const earlier of spec.avoid) if (resolvePhrase(earlier, p)) return resolvePhrase(earlier, p)!;
+    return fromUser(p) && asksToAdd ? p.trim() : "";
+  };
   // The quoted target line itself isn't a "keep" phrase: keeping all of it leaves nothing
   // to reword, and the model could only append ("We plan it with you. We craft with you.").
   const isWholeLine = (p: string) =>
-    normalizeText(p).toLowerCase().length >= normalizeText(line).toLowerCase().length * 0.9;
-  const keep = resolve(spec.keep).filter((k) => !isWholeLine(k));
-  const drop = resolve(spec.drop);
+    normalizeText(p).toLowerCase().length >= normalizeText(line).toLowerCase().length * 0.8;
+  const keep = [...new Set(spec.keep.map(resolveKeep).filter(Boolean))].filter((k) => !isWholeLine(k));
+  // Keep phrases that match nothing are likely typos; options mustn't copy them either.
+  const unclear = spec.keep.filter((p) => !resolveKeep(p));
+  const drop = [...new Set(spec.drop.map((d) => resolvePhrase(line, d) ?? "").filter(Boolean))];
   const allowed = [checkContext(ctx).allowedText, line, spec.userWords].join("\n");
   const has = (text: string, phrase: string) =>
     normalizeText(text).toLowerCase().includes(normalizeText(phrase).toLowerCase());
@@ -354,7 +370,15 @@ export async function rewordText(
   const rest = contentWords(
     keep.reduce((t, k) => t.replace(new RegExp(escapeRegExp(normalizeText(k)), "i"), " "), normalizeText(line)),
   );
-  const fill = template(line, keep);
+  // Only dropping ("drop X and make the rest work"): the rest of the line is the fixed part,
+  // and the model only smooths the gap or ending.
+  const remainder = drop
+    .reduce((t, d) => t.replace(d, " "), line)
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  const implicitKeep =
+    !keep.length && drop.length && remainder && remainder !== line ? [remainder.replace(/[\s—–,;:-]+$/, "")] : [];
+  const fill = template(line, keep.length ? keep : implicitKeep);
   // Parallel list items ("We listen / We plan / We build"): when the neighbours share the
   // first word but not the second, the first two words name the step and must stay.
   const lead = (t: string) => wordsIn(t.replace(/^\s*(?:[-*+•]|\d+[.)])\s+/, "")).slice(0, 2);
@@ -374,6 +398,13 @@ export async function rewordText(
     if (avoid.includes(normalizeText(option).toLowerCase()))
       problems.push("repeats a version the user already rejected");
     for (const d of directions) if (has(option, d)) problems.push("copies the user's note instead of writing copy");
+    // Matched on the phrase's last two words too: "we bring reach" slipped past a whole-phrase check.
+    for (const u of unclear) {
+      const tail = wordsIn(u).slice(-2).join(" ");
+      if (has(option, u) || (tail.includes(" ") && wordsIn(option).join(" ").includes(tail))) {
+        problems.push(`copies the unclear phrase "${u}"`);
+      }
+    }
     if (/\b(I want|I'd like|vibes?)\b/i.test(option) && !/\b(I want|I'd like|vibes?)\b/i.test(line)) {
       problems.push("uses the user's phrasing instead of copy");
     }
@@ -382,6 +413,12 @@ export async function rewordText(
       if (rest.filter((w) => optionWords.has(w)).length / rest.length > 0.5) problems.push("the rest wasn't reworked");
     }
     if (/<\/?[a-z][^>]*>|[<>_]{1,3}/i.test(option)) problems.push("contains markup or a blank");
+    if (/^\s*(?:[-*+•]|\d+[.)])\s/.test(option) || /\s\d+[.)]\s+[A-Z]/.test(option))
+      problems.push("contains a list number");
+    for (const n of [surroundings.before, surroundings.after].filter((x) => x.length > 8)) {
+      const bare = (t: string) => normalizeText(t.replace(/^\s*(?:[-*+•]|\d+[.)]|#{1,6})\s*/, "")).toLowerCase();
+      if (bare(option).includes(bare(n)) || bare(n).includes(bare(option))) problems.push("copies a neighbouring line");
+    }
     if (stepName && lead(option).join(" ") !== stepName)
       problems.push(`must start with "${stepName}", the step it names`);
     if (option.includes("\n") && !line.includes("\n")) problems.push("must be a single line");
@@ -438,5 +475,10 @@ export async function rewordText(
       reason: `No option met the request (keep ${keep.join(", ") || "nothing"}; leave out ${drop.join(", ") || "nothing"}).`,
     };
   }
-  return { ok: true, best: valid[0], alternatives: valid.slice(1, 3) };
+  // Prefer options that don't bring back the dropped phrase's words in another form
+  // ("drop 'to your practice and patients'" → not "…for patients, making care better").
+  const droppedWords = new Set(drop.flatMap(contentWords));
+  const reuse = (o: string) => contentWords(o).filter((w) => droppedWords.has(w)).length;
+  const ranked = [...valid].sort((a, b) => reuse(a) - reuse(b));
+  return { ok: true, best: ranked[0], alternatives: ranked.slice(1, 3) };
 }
