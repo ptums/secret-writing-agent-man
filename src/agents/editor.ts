@@ -61,8 +61,7 @@ Judge two things.
 
 ${EDITOR_CRITERIA}
 
-Facts problems are serious: they send the draft back to the writer. Whether the draft does what was asked is judged by the requirements above, so Request, Voice, and Clean problems are minor: note them, but they don't block a pass.
-A draft passes if at least ${PASS_ACCURACY * 10}% of the requirements are met and there are no Facts problems.
+A draft goes back to the writer only if fewer than ${PASS_ACCURACY * 10}% of the requirements are met. Facts problems don't send it back: you fix those yourself afterwards, so quote them exactly. Request, Voice, and Clean problems are minor: note them briefly.
 
 Return:
 - requirements: each requirement and whether the draft meets it
@@ -77,25 +76,31 @@ const DraftReview = z.object({
   instructions: z.string(),
 });
 
+type Problem = { quote?: string; problem: string };
+
 type DraftVerdict = {
   draft: string;
   accuracy: number;
-  serious: string[];
+  // Fact problems with a quote: the editor fixes these itself (fixFacts).
+  facts: Problem[];
+  // Structural problems (empty sections): the writer redrafts.
+  structural: string[];
   minor: string[];
   notes: string;
-  passed: boolean;
+  // Does what was asked and has no structural problems; fact problems don't block.
+  fulfills: boolean;
 };
 
-// Tiered: only unmet requirements, the model's Facts problems, and serious code checks send a
-// draft back. With every flag blocking, no draft passed in testing (an 8B reviewer always
-// finds a nitpick; 6–12 minutes per piece). The model's Request/Clean labels were nitpicks
-// too ("not formatted as a button"), and both are covered better elsewhere: the requirements
-// checklist for the request, the code checks for structure.
-// A model "Facts" flag only blocks when the quote contains something checkable: a number,
+// A model "Facts" flag only counts when the quote contains something checkable: a number,
 // price, percentage, or a quoted testimonial. Elsewhere it flagged general knowledge in a
 // health essay ("carbs raise blood sugar") and "two loaves" vs "2 loaves" as fact problems.
 const checkable = (quote: string) => /\d|[$%]|["“][^"”]{8,}["”]/.test(quote);
+const STRUCTURAL = /no text under it/;
 
+// Tiered, as the owner chose: only unmet requirements and structural problems send a draft
+// back to the writer. With every flag blocking, no draft passed in testing (an 8B reviewer
+// always finds a nitpick; 6–12 minutes per piece). The model's Request/Clean/Voice notes are
+// minor: the requirements checklist covers the request and the code checks cover structure.
 export async function reviewDraft(draft: string, ctx: EditorContext): Promise<DraftVerdict> {
   // The code checks are flags too: they catch what the model reviewer misses.
   const findings = runChecks(draft, checkContext(ctx));
@@ -105,40 +110,84 @@ export async function reviewDraft(draft: string, ctx: EditorContext): Promise<Dr
       new SystemMessage(DRAFT_REVIEW_PROMPT),
       new HumanMessage(`The request:\n${describeRequest(ctx.request)}\n\nThe draft:\n<<<\n${draft}\n>>>`),
     ]);
-  const describe = (quote: string | undefined, problem: string) => (quote ? `"${quote}": ${problem}` : problem);
-  const serious = [
-    ...review.problems
-      .filter((p) => p.criterion === "Facts" && checkable(p.quote))
-      .map((p) => describe(p.quote, `${p.problem} (Facts)`)),
-    ...findings.filter((f) => f.severity === "serious").map((f) => describe(f.quote, f.problem)),
+  const describe = (p: Problem) => (p.quote ? `"${p.quote}": ${p.problem}` : p.problem);
+  const facts: Problem[] = [
+    ...review.problems.filter((p) => p.criterion === "Facts" && checkable(p.quote)),
+    ...findings.filter((f) => f.severity === "serious" && f.quote && !STRUCTURAL.test(f.problem)),
   ];
+  const structural = findings.filter((f) => STRUCTURAL.test(f.problem)).map(describe);
   const minor = [
-    ...review.problems
-      .filter((p) => p.criterion !== "Facts" || !checkable(p.quote))
-      .map((p) => describe(p.quote, p.problem)),
-    ...findings.filter((f) => f.severity === "style").map((f) => describe(f.quote, f.problem)),
-  ];
+    ...review.problems.filter((p) => p.criterion !== "Facts" || !checkable(p.quote)),
+    ...findings.filter((f) => f.severity === "style" || (f.severity === "serious" && !f.quote)),
+  ].map(describe);
+  if (process.env.DEBUG_EDITOR) console.info(`[editor] facts:\n${facts.map(describe).join("\n")}`);
   // Accuracy is the share of the request's requirements met: a 1–10 gut score from the model
   // came back 9–10 for every draft in testing, so it couldn't tell drafts apart (this scores
   // a matching draft 10/10 and an off-topic one 0/10).
-  if (process.env.DEBUG_EDITOR) console.info(`[editor] serious:\n${serious.join("\n")}`);
   const met = review.requirements.filter((q) => q.met).length;
   const accuracy = review.requirements.length ? Math.round((10 * met) / review.requirements.length) : 10;
   const unmet = review.requirements.filter((q) => !q.met).map((q) => q.requirement);
   const list = (items: string[]) => items.map((i) => `- ${i}`).join("\n");
   const notes = [
     unmet.length && `Requirements the draft doesn't meet yet:\n${list(unmet)}`,
-    serious.length && `Must fix:\n${list(serious)}`,
+    (structural.length || facts.length) && `Must fix:\n${list([...structural, ...facts.map(describe)])}`,
     review.instructions && `Instructions: ${review.instructions}`,
     minor.length && `Also improve if you can:\n${list(minor)}`,
   ]
     .filter(Boolean)
     .join("\n\n");
-  return { draft, accuracy, serious, minor, notes, passed: accuracy >= PASS_ACCURACY && !serious.length };
+  return {
+    draft,
+    accuracy,
+    facts,
+    structural,
+    minor,
+    notes,
+    fulfills: accuracy >= PASS_ACCURACY && !structural.length,
+  };
 }
 
-// Writer drafts → editor reviews → writer redrafts with the editor's notes, until a draft
-// passes or MAX_DRAFTS is reached; then the best draft wins.
+const FIX_FACTS_PROMPT = `You are a copy editor fixing fact problems in a draft. For each problem you're given, return an exact fix:
+- quote: the exact text from the draft, copied character for character
+- replacement: the corrected text. Remove the unsupported claim, state a goal as an aim ("built to cut no-shows"), or use a bracketed placeholder like [customer count]. Keep the sentence readable and in the same voice. Never add a new number, price, day, or duration.
+Fix only the listed problems. Change nothing else.`;
+
+// The editor fixes remaining fact problems itself rather than asking for another draft (the
+// owner's choice): a redraft for one stray number cost minutes and often introduced new ones.
+async function fixFacts(draft: string, facts: Problem[], ctx: EditorContext) {
+  if (!facts.length) return draft;
+  const checks = checkContext(ctx);
+  const { issues } = await editorModel()
+    .withStructuredOutput(Review)
+    .invoke([
+      new SystemMessage(FIX_FACTS_PROMPT),
+      new HumanMessage(
+        `The request:\n${describeRequest(ctx.request)}\n\nProblems to fix:\n${facts.map((f) => `- "${f.quote}": ${f.problem}`).join("\n")}\n\nThe draft:\n<<<\n${draft}\n>>>`,
+      ),
+    ]);
+  let content = draft;
+  let applied = 0;
+  for (const issue of issues.slice(0, MAX_FIXES_PER_ROUND)) {
+    if (normalizeText(issue.quote) === normalizeText(issue.replacement)) continue;
+    if (rejectFix(content, issue, checks.allowedText)) continue;
+    const result = applyEdit(content, issue.quote, issue.replacement);
+    if (result.ok) {
+      content = result.content;
+      applied++;
+    }
+  }
+  // Same guard as revision reviews: fixes that gut the draft are thrown away.
+  if (wordCount(content) < wordCount(draft) * (1 - MAX_ROUND_CUT) || emptiedSection(draft, content)) {
+    console.info("[editor] fact fixes discarded (cut too much)");
+    return draft;
+  }
+  console.info(`[editor] fixed facts: ${applied} of ${facts.length}`);
+  return content;
+}
+
+// Writer drafts → editor reviews. A draft that doesn't do what was asked (or has structural
+// problems) goes back to the writer with notes, up to MAX_DRAFTS. Remaining fact problems on
+// the chosen draft are fixed by the editor, then the safety net runs.
 export async function draftWithReview(request: WriteRequest) {
   const ctx: EditorContext = { request, guidance: NO_GUIDANCE };
   const verdicts: DraftVerdict[] = [];
@@ -147,21 +196,40 @@ export async function draftWithReview(request: WriteRequest) {
     const verdict = await reviewDraft(draft, ctx);
     verdicts.push(verdict);
     console.info(
-      `[editor] draft ${n}: accuracy ${verdict.accuracy}/10, ${verdict.serious.length} serious / ${verdict.minor.length} minor → ${verdict.passed ? "pass" : n < MAX_DRAFTS ? "back to the writer" : "out of drafts"}`,
+      `[editor] draft ${n}: accuracy ${verdict.accuracy}/10, ${verdict.structural.length} structural, ${verdict.facts.length} facts, ${verdict.minor.length} minor → ${verdict.fulfills ? "accepted" : n < MAX_DRAFTS ? "back to the writer" : "out of drafts"}`,
     );
-    if (verdict.passed || n === MAX_DRAFTS) break;
+    if (verdict.fulfills || n === MAX_DRAFTS) break;
     draft = await redraftContent(request, verdict.notes);
   }
-  // Best = a passing draft if any; else most accurate, then fewest serious, then fewest minor.
-  const rank = (v: DraftVerdict) => [v.passed ? 1 : 0, v.accuracy, -v.serious.length, -v.minor.length];
+  // Best = one that fulfills the request if any; else most accurate, then fewest structural,
+  // fact, and minor problems.
+  const rank = (v: DraftVerdict) => [
+    v.fulfills ? 1 : 0,
+    v.accuracy,
+    -v.structural.length,
+    -v.facts.length,
+    -v.minor.length,
+  ];
   const better = (a: DraftVerdict, b: DraftVerdict) => {
     const [ra, rb] = [rank(a), rank(b)];
     const i = ra.findIndex((x, k) => x !== rb[k]);
     return i === -1 ? b : ra[i] > rb[i] ? a : b; // ties go to the later draft
   };
   const best = verdicts.reduce(better);
-  const checks = checkContext(ctx);
-  return removeOutOfScope(confirmUnsupported(best.draft, checks), checks).replace(/^(#{1,6})(?=[^\s#])/gm, "$1 ");
+  const fixed = await fixFacts(best.draft, best.facts, ctx);
+  return safetyNet(fixed, checkContext(ctx));
+}
+
+// Last pass after the editor: unsupported numbers and goals-as-results become "[confirm: …]";
+// out-of-scope sentences, leaked label headings, and preambles are removed.
+function safetyNet(content: string, checks: ReturnType<typeof checkContext>) {
+  let result = removeOutOfScope(confirmUnsupported(content, checks), checks);
+  const preamble = runChecks(result, checks).find((f) => f.quote && /^Preamble/.test(f.problem));
+  if (preamble) {
+    const removed = applyEdit(result, preamble.quote!, "");
+    if (removed.ok) result = removed.content;
+  }
+  return result.replace(/^(#{1,6})(?=[^\s#])/gm, "$1 ");
 }
 
 // Safety net after the last draft: a sentence mentioning something the source lists as out of
