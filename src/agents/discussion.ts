@@ -20,7 +20,8 @@ import type { LineOptions } from "@/lib/options";
 import { applyEdit, findSpan, normalizeText } from "@/lib/textEdit";
 import { discussionModel } from "./models";
 import { textToolCallMiddleware } from "./textToolCalls";
-import { draftWithReview, reviseAndEdit, rewordText, type StandingGuidance } from "./editor";
+import { draftWithReview, reviseAndEdit, reviseSection, rewordText, type StandingGuidance } from "./editor";
+import { newDuplicateSentences } from "./editorChecks";
 import { formatBrief, summarizeConversation } from "./handoff";
 
 const SYSTEM_PROMPT = `You are the account lead at a small writing studio. You are the only one who talks with the user. Two specialists do the writing, and they never see this conversation:
@@ -43,10 +44,13 @@ They know only what your tool calls tell them, so every handoff must be complete
 Choose one tool per change:
 - edit_text: the user gives the exact new text ("replace X with Y", "change X to Y", "drop X", "add Y after X"). The new text must be their words, copied from their message. To remove, use an empty "replace". To add a line, find the text it goes after and replace it with that text plus the new line.
 - reword_text: the user wants a line or sentence reworded or improved without giving the exact new words: "reword this", "suggest another", "I don't like the rest", "keep X", or a part marked with <angle brackets>. Put the phrases they want kept in "keep" and the ones they want gone in "drop", copied from their message. Put what the new wording should convey, in their words, in "direction".
-- revise_document: broad changes to the whole document or a whole section, like tone, length, or focus. "instructions" is one explicit instruction, like a request.
+- revise_document: broad changes to the whole document (tone, length, focus), or changes to one section's structure: a new heading, moving a line, merging repeated lines. For one section, set "target" to text quoted from that section, and only that section changes. "instructions" is one explicit instruction, like a request.
 Feedback like "getting closer", "not quite", or "I like X but…/I don't like the rest" asks for another change, not approval: call reword_text again. Praise on its own ("I like it", "feels like us", "looks good") is not a request: thank them and change nothing.
 "This", "it", "this bullet", or "this line" usually means the line from the most recent change (see the note under the message). If you can't tell which text they mean, ask one short question.
 Never create a new document for an edit.
+
+# Questions
+If the user asks a question ("why is…", "what does…", "is this…"), answer it in one or two sentences using the document text under their message, and offer to fix what they're asking about. Don't change the document until they ask.
 
 # Other tools
 - "Rename…", "call it…", or "change the title…" means rename_document, never create_content.
@@ -75,7 +79,12 @@ type TurnState = {
   failedEdits: number;
   // Other wordings from reword_text, offered in the chat with a "Use" button.
   options: LineOptions[];
+  // Set when a change tool failed, so the reply can't claim success.
+  failure: string | null;
 };
+
+const SECTION_CHANGE =
+  /\b(sub ?-?title|this section|that section|the section|move (it|this|that)|merge|combine|restructure|reorder)\b/i;
 
 const NOT_A_CHANGE =
   "The user didn't ask for a change in this message. Don't change the document; reply to what they said.";
@@ -337,7 +346,7 @@ function buildTools(state: TurnState, thread: { doc: Document; userMessage: stri
   );
 
   const reviseDoc = tool(
-    async ({ id, instructions, scope }) => {
+    async ({ id, instructions, scope, target }) => {
       if (state.changedThisTurn) return ALREADY_CHANGED;
       if (!asksForChange(thread.userMessage)) return NOT_A_CHANGE;
       const current = await getDocument(id);
@@ -347,6 +356,25 @@ function buildTools(state: TurnState, thread: { doc: Document; userMessage: stri
       // The explicit instruction plus the user's own words. No chat summary here: it quoted
       // earlier versions of lines, and a rewrite restored them over the user's later edits.
       const withUserWords = `${instructions}\nThe user's own words: "${thread.userMessage}"`;
+      // One section: resolved from the user's quotes first (the model once targeted the
+      // wrong line), then rewritten on its own and spliced back.
+      const section =
+        (scope ?? inferScope(instructions)) === "part"
+          ? resolveTarget(current.content, target ?? "", thread.userMessage, thread.history)
+          : null;
+      if (section?.ok) {
+        const next = await reviseSection(current.content, section.span, withUserWords);
+        if (!next) {
+          state.failure =
+            "I couldn't make that change cleanly, so nothing in the document changed. Could you say it another way?";
+          return "The editor couldn't make that change cleanly. Nothing changed. Ask the user to say it another way.";
+        }
+        await reviseDocument(id, { content: next }, { kind: "revise", instructions });
+        state.documentId = id;
+        state.changedThisTurn = true;
+        recordChange(state, current.content, next);
+        return "Done. The user sees the exact change. Reply in one short sentence.";
+      }
       const rewritten = await reviseAndEdit(current.content, withUserWords, scope ?? inferScope(instructions), {
         request: { contentType: current.contentType, brief: current.brief, sourceMaterial: current.sourceMaterial },
         guidance: await standingGuidance(current),
@@ -370,6 +398,7 @@ function buildTools(state: TurnState, thread: { doc: Document; userMessage: stri
           .enum(["whole", "part"])
           .optional()
           .describe('"whole" for tone, length, or focus across the document; "part" for one section or line'),
+        target: z.string().optional().describe("For one section: text quoted from that section"),
       }),
     },
   );
@@ -378,6 +407,7 @@ function buildTools(state: TurnState, thread: { doc: Document; userMessage: stri
     async ({ find, replace }) => {
       // New text must come from the user. The router once "reworded" lines itself through
       // this tool; its lines were weaker and got saved as the user's own words.
+      if (!asksForChange(thread.userMessage)) return NOT_A_CHANGE;
       if (!isUsersWording(find, replace, thread.userMessage)) {
         return "That new text isn't in the user's message. Use edit_text only with the user's exact words. To reword or improve text, call reword_text and let the editor write it.";
       }
@@ -390,6 +420,11 @@ function buildTools(state: TurnState, thread: { doc: Document; userMessage: stri
         return result.reason === "ambiguous"
           ? `That text appears ${result.count} times in the document, so it's unclear which one to change. Don't retry; ask the user which one they mean (e.g. the first or second), or to quote more of the surrounding text.`
           : "That exact text isn't in the document. If the user described the change rather than quoting text, use revise_document; otherwise ask them to paste the exact text.";
+      }
+      // "Why is this duplicated?" once led the router to copy the duplicated sentence into
+      // another line; an edit may not create duplicate text.
+      if (newDuplicateSentences(current.content, result.content).length) {
+        return "That edit would copy text that's already in the document. Don't make it; ask the user what they want changed.";
       }
       const instructions = replace.trim() ? `Replace "${find}" with "${replace}"` : `Remove "${find}"`;
       await reviseDocument(current.id, { content: result.content }, { kind: "edit", instructions, find, replace });
@@ -414,6 +449,11 @@ function buildTools(state: TurnState, thread: { doc: Document; userMessage: stri
     async ({ find, keep, drop, direction }) => {
       if (state.revisedThisTurn) return ALREADY_CHANGED;
       if (!asksForChange(thread.userMessage)) return NOT_A_CHANGE;
+      // "New title for this section and make the title the subtitle" is a section change;
+      // rewording the heading alone left the duplicate in place.
+      if (SECTION_CHANGE.test(thread.userMessage)) {
+        return 'This is a change to a section\'s structure. Call revise_document with scope "part" and "target" set to text quoted from that section.';
+      }
       const current = await getDocument(thread.doc.id);
       if (!current) return NOT_FOUND(thread.doc.id);
       const found = resolveTarget(current.content, find, thread.userMessage, thread.history);
@@ -468,6 +508,8 @@ function buildTools(state: TurnState, thread: { doc: Document; userMessage: stri
       );
       if (!result.ok) {
         state.failedEdits++;
+        state.failure =
+          "I couldn't find wording that fits what you asked, so nothing changed. What should I keep or change?";
         return `${result.reason} Nothing was changed. Ask the user one short question about what to keep or change.`;
       }
       const content = current.content.slice(0, start) + result.best + current.content.slice(end);
@@ -535,6 +577,7 @@ export async function runDiscussionTurn(input: {
     revisedThisTurn: false,
     failedEdits: 0,
     options: [],
+    failure: null,
   };
   const { threadDoc } = input;
 
@@ -544,7 +587,8 @@ export async function runDiscussionTurn(input: {
     isBlank(threadDoc)
       ? `[This conversation's document is empty (id ${threadDoc.id}). Only write into it if the user asks you to write something now.]`
       : `[Open document: "${threadDoc.title}" (id ${threadDoc.id}, type ${threadDoc.contentType})]`,
-    ...lastChangeNote(input.history),
+    ...lastChangeNote(input.history, threadDoc.content, input.message),
+    ...questionNote(threadDoc.content, input.message),
     ...input.notes,
   ];
   const currentMessage = `${input.message}\n\n${notes.join("\n")}`;
@@ -567,7 +611,11 @@ export async function runDiscussionTurn(input: {
   ];
 
   const result = await agent.invoke({ messages }, { recursionLimit: 12 });
-  const reply = result.messages.at(-1)?.text?.trim() || "Done.";
+  let reply = result.messages.at(-1)?.text?.trim() || "Done.";
+  // A tool failed and nothing changed, but the reply claims it did: the router did exactly this
+  // ("The document has been updated with a new title and subtitle") in testing.
+  const claimsChange = /\b(updated|revised|changed|reworded|rewritten|done|added|removed|replaced)\b/i;
+  if (state.failure && !state.changedThisTurn && claimsChange.test(reply)) reply = state.failure;
   return {
     reply,
     documentId: state.documentId,
@@ -578,13 +626,29 @@ export async function runDiscussionTurn(input: {
 }
 
 // Follow-ups ("this bullet is getting closer") almost always refer to the line just changed.
-function lastChangeNote(history: ChatMessage[]) {
+function lastChangeNote(history: ChatMessage[], content: string, message: string) {
+  // When the user quotes text from the document, that's what they mean: the hint pointed
+  // the router at the last-changed line instead, and it edited the wrong one.
+  const quotesDocument = [
+    ...[...message.matchAll(/["“]([^"“”]{12,})["”]/g)].map((m) => m[1]),
+    ...message.split("\n").filter((l) => l.trim().length >= 20),
+  ].some((q) => findSpan(content, q.trim()).ok);
   const last = recentChanges(history).at(-1);
-  if (!last || last.added.length !== 1) return [];
+  if (quotesDocument || !last || last.added.length !== 1) return [];
   const from = last.removed.length === 1 ? ` (it replaced "${last.removed[0]}")` : "";
   return [
     `[Most recent change: the line now reads "${last.added[0]}"${from}. "This", "it", or "the bullet" most likely means this line.]`,
   ];
+}
+
+const QUESTION_DOC_CHARS = 6000;
+
+// A question about the document needs its text to be answered ("Why is this duplicated?").
+function questionNote(content: string, message: string) {
+  const isQuestion = /\?\s*$|^\s*(why|what|how|is|are|does|do|can|where|which)\b/im.test(message);
+  if (!isQuestion || !content.trim()) return [];
+  const text = content.length > QUESTION_DOC_CHARS ? `${content.slice(0, QUESTION_DOC_CHARS)}\n[…]` : content;
+  return [`[The document's current text, for answering the question:\n${text}]`];
 }
 
 // A quoted fragment ("drop 'to your practice…'") means rework its whole line, not just the

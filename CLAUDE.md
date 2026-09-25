@@ -49,6 +49,14 @@ Config comes from `.env.local` (see `.env.example`): `DATABASE_URL`, `OLLAMA_BAS
 - `asksForChange`: `revise_document` and `reword_text` run only when the message asks for a change ("I really like how the hero reads now" produced a rewrite).
 - `restoreDecisions`: after a rewrite, puts back the user's recent line-level decisions (exact edits, rewords, picked options, all recorded with find/replace) if an older version of the line reappears, including cut-down versions.
 
+**Section changes** ("new title for this section and make the title the subtitle"). `revise_document` with scope `part` resolves a target from the user's quotes (`resolveTarget`), and the editor's `reviseSection` rewrites only that section, from its heading to the next heading or `---`. The result is spliced back with the heading level enforced and moved text kept verbatim. `reword_text` hands section-structure requests to it (`SECTION_CHANGE`).
+
+**More guards from a real session** where the router edited the wrong line:
+- `edit_text` requires a change request (a question like "Why is this duplicated?" once caused an edit), and it's rejected if it creates duplicate sentences (`newDuplicateSentences`), which `isMalformed` also checks for rewrites.
+- The "most recent change" hint is dropped when the user quotes document text.
+- A question gets the document text attached (`questionNote`), so the agent can answer instead of editing.
+- If a change tool failed and nothing changed, a reply claiming success is replaced with an honest one (`state.failure`).
+
 **Choosing how to change text** (the discussion agent's tools):
 - `edit_text` is only for the user's exact new words. Code refuses a replacement containing words that aren't in the user's message or the replaced text (`isUsersWording`). The router used to "reword" lines itself through this tool; its lines were weak and got saved as the user's own words.
 - `reword_text` is for rewording one line ("reword this", "keep X, I don't like the rest", `<…>` directions, "suggest another"). The editor's `rewordText` writes several options and code validates each one:

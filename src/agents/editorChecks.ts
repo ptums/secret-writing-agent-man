@@ -295,3 +295,20 @@ export function runChecks(content: string, ctx: CheckContext): Finding[] {
 function findSpanLoose(content: string, text: string) {
   return normalizeText(content).toLowerCase().includes(normalizeText(text).toLowerCase());
 }
+
+// Sentences (normalized, 20+ chars) that appear more often in `after` than in `before`, e.g.
+// an edit that copies a heading's sentence into the paragraph above it.
+export function newDuplicateSentences(before: string, after: string) {
+  const counts = (t: string) => {
+    const m = new Map<string, number>();
+    for (const s of sentences(t)) {
+      const n = normalizeText(s)
+        .toLowerCase()
+        .replace(/[.!?]+$/, "");
+      if (n.length >= 20) m.set(n, (m.get(n) ?? 0) + 1);
+    }
+    return m;
+  };
+  const [b, a] = [counts(before), counts(after)];
+  return [...a].filter(([s, n]) => n > 1 && n > (b.get(s) ?? 0)).map(([s]) => s);
+}

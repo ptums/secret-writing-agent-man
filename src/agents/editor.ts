@@ -5,6 +5,7 @@ import {
   BANNED_PHRASES,
   LITERAL_HEADINGS,
   MAX_SENTENCE_WORDS,
+  newDuplicateSentences,
   readSourceRules,
   runChecks,
   sentences,
@@ -485,7 +486,12 @@ function duplicateLines(text: string) {
 function isMalformed(revised: string, original: string) {
   const before = duplicateLines(original);
   const newDuplicates = [...duplicateLines(revised)].some((line) => !before.has(line));
-  return headingCount(revised) > headingCount(original) + 1 || revised.length > original.length * 1.8 || newDuplicates;
+  return (
+    headingCount(revised) > headingCount(original) + 1 ||
+    revised.length > original.length * 1.8 ||
+    newDuplicates ||
+    newDuplicateSentences(original, revised).length > 0
+  );
 }
 
 // Last resort for whole-document changes: smaller pieces echo far less (5/6 sections
@@ -742,4 +748,75 @@ export async function rewordText(
   const reuse = (o: string) => contentWords(o).filter((w) => droppedWords.has(w)).length;
   const ranked = [...valid].sort((a, b) => reuse(a) - reuse(b));
   return { ok: true, best: ranked[0], alternatives: ranked.slice(1, 3) };
+}
+
+// ---- Changing one section --------------------------------------------------------------
+//
+// "We need a new title for this section and make the title the subtitle": a structural change
+// to one section. Only that section (its heading through the line before the next heading or
+// "---") goes to the model; the result is spliced back, so nothing else can change. Before
+// this, the router applied such requests as exact edits to the wrong line.
+
+export function sectionAround(content: string, span: { start: number; end: number }) {
+  const lines = content.split("\n");
+  const starts: number[] = [];
+  let offset = 0;
+  for (const l of lines) {
+    starts.push(offset);
+    offset += l.length + 1;
+  }
+  const lineOf = (pos: number) => starts.findLastIndex((st) => st <= pos);
+  const isHeading = (l: string) => /^#{1,6}\s/.test(l);
+  const boundary = (l: string) => isHeading(l) || /^\s*(-{3,}|\*{3,})\s*$/.test(l);
+  let first = lineOf(span.start);
+  while (first > 0 && !isHeading(lines[first]) && !boundary(lines[first - 1])) first--;
+  if (!isHeading(lines[first]) && first > 0 && isHeading(lines[first - 1])) first--;
+  let last = lineOf(span.end);
+  while (last + 1 < lines.length && !boundary(lines[last + 1])) last++;
+  const start = starts[first];
+  const end = starts[last] + lines[last].length;
+  return { start, end, text: content.slice(start, end).trimEnd() };
+}
+
+export async function reviseSection(
+  content: string,
+  span: { start: number; end: number },
+  instructions: string,
+): Promise<string | null> {
+  const section = sectionAround(content, span);
+  const hadHeading = /^#{1,6}\s/.test(section.text);
+  for (const temperature of [0.5, 0.8]) {
+    const response = await editorModel({ temperature }).invoke([
+      new HumanMessage(
+        [
+          `This is one section of a longer piece:\n<<<\n${section.text}\n>>>`,
+          `Change this section: ${instructions}`,
+          "Keep its facts and Markdown structure. Text the user asks you to move (for example, making the old title the subtitle) stays word for word. Don't repeat any sentence, and don't copy sentences from the rest of the piece.",
+          hadHeading && "Start with the section's heading line (a # heading at the same level).",
+          "Return only the revised section in Markdown.",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      ),
+    ]);
+    // Keep the section's heading level: the model once turned "##" into "#".
+    const level = section.text.match(/^#{1,6}/)?.[0];
+    const out = stripFence(response.text)
+      .trim()
+      .replace(/^#{1,6}(?=\s)/, (h) => level ?? h);
+    const next = content.slice(0, section.start) + out + content.slice(section.start + section.text.length);
+    const ok =
+      Boolean(out) &&
+      normalizeText(out) !== normalizeText(section.text) &&
+      (!hadHeading || /^#{1,6}\s/.test(out)) &&
+      !isMalformed(next, content);
+    console.info(`[editor] section rewrite: ${ok ? "ok" : "rejected"}`);
+    if (!ok && process.env.DEBUG_EDITOR) {
+      console.info(
+        `[editor] rejected section:\n${out}\n(duplicates: ${newDuplicateSentences(content, next).join(" | ") || "none"}; malformed: ${isMalformed(next, content)})`,
+      );
+    }
+    if (ok) return next;
+  }
+  return null;
 }
