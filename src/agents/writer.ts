@@ -34,9 +34,9 @@ const FORMAT_GUIDANCE: Record<ContentType, string> = {
   blog_post:
     "Blog post: 800–1500 words, a hook intro, H2 sections, and a conclusion with a CTA. Search-friendly headings.",
   landing_page:
-    "Landing page: hero headline + subhead, benefit sections, social-proof placeholders, objection handling, a CTA after the hero and once more at the end (no other CTAs). Label each section with an H2.",
+    "Landing page: open with a headline, a one-line subhead, and a call to action; then benefit sections, social-proof placeholders, and objections answered; close with the call to action once more (no other CTAs). Give each section an H2 that is a real headline about its content.",
   website_copy:
-    'Website copy for a marketing homepage, each section labeled with an H2: Hero (headline, one-line subhead, primary CTA button text); The problem (in the reader\'s words); How it works (3 short steps); Features, written as benefits (group related features, don\'t just list them); Pricing (if given); FAQ (3–5 real objections, answered); Final CTA. These are section types, not headings: write a real headline for each H2 (never "Hero" or "Features").',
+    "Website copy for a marketing homepage, in this order, each section under an H2 that is a real headline about its content: an opening headline with a one-line subhead and the main call to action; the problem, in the reader's words; how it works, in 3 short steps; the features, written as benefits and grouped; pricing (if given); 3–5 real objections, answered; a closing call to action.",
   email: "Email: provide 3 subject line options and preview text, then the body. Short paragraphs, one CTA.",
   ad_copy:
     "Ad copy: several variants (headline, primary text, CTA) grouped by H2, respecting typical platform length limits.",
@@ -60,7 +60,11 @@ export function describeRequest(req: WriteRequest) {
   return [
     `Content type: ${req.contentType}`,
     FORMAT_GUIDANCE[req.contentType],
-    `Brief: ${req.brief}`,
+    // Handoffs arrive as "Request: …\n\nConversation context: …" (see ./handoff.ts).
+    req.brief.startsWith("Request:") ? req.brief : `Brief: ${req.brief}`,
+    // Without this, an essay opened with "You've shared that you enjoy bagels…".
+    req.brief.includes("Conversation context:") &&
+      "Use the conversation context to shape the piece. Don't mention the conversation or repeat the user's words back to them.",
     req.audience && `Audience: ${req.audience}`,
     req.tone && `Tone: ${req.tone}`,
     req.keywords?.length && `Keywords to include naturally: ${req.keywords.join(", ")}`,
@@ -87,7 +91,17 @@ async function run(prompt: string, temperature?: number) {
   return stripFence(response.text);
 }
 
-// First drafts only: the editor (./editor.ts) reviews every draft and handles all revisions.
+// Drafts only: the editor (./editor.ts) reviews every draft, sends it back with notes until it
+// passes, and handles all revisions of existing documents.
 export function writeContent(req: WriteRequest) {
   return run(`Write the following.\n\n${describeRequest(req)}`);
+}
+
+// A new draft after the editor sent the last one back. The notes quote the passages that
+// failed; the earlier draft itself isn't included, because with the house style as the
+// system prompt, qwen3:8b tends to hand an existing document back unchanged.
+export function redraftContent(req: WriteRequest, editorNotes: string) {
+  return run(
+    `Write the following.\n\n${describeRequest(req)}\n\nThe editor sent back your previous draft. Write a new draft that fixes every point below and keeps what they said worked.\n${editorNotes}`,
+  );
 }

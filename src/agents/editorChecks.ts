@@ -4,7 +4,8 @@ import { normalizeText } from "@/lib/textEdit";
 // and catch what an 8B model reviewer misses (invented days, long sentences). Findings
 // with a `quote` point at exact text the editor can fix; the rest are document-level.
 
-export type Finding = { quote?: string; problem: string };
+// "serious" findings (facts, structure) send a draft back to the writer; "style" ones don't.
+export type Finding = { quote?: string; problem: string; severity: "serious" | "style" };
 
 export type CheckContext = {
   // Everything a fact may come from: brief, source material, the user's instructions and lines.
@@ -180,6 +181,7 @@ export function runChecks(content: string, ctx: CheckContext): Finding[] {
     findings.push({
       quote: firstLine.trim(),
       problem: "Preamble or note to the user; the piece must start with the deliverable itself.",
+      severity: "serious",
     });
   }
 
@@ -188,6 +190,7 @@ export function runChecks(content: string, ctx: CheckContext): Finding[] {
       findings.push({
         quote: line.trim(),
         problem: "A section label used as a heading; write a real headline instead.",
+        severity: "serious",
       });
     }
   }
@@ -200,17 +203,19 @@ export function runChecks(content: string, ctx: CheckContext): Finding[] {
       findings.push({
         quote: s,
         problem: `Sentence is ${n} words; the limit is ${MAX_SENTENCE_WORDS}. Split or tighten it.`,
+        severity: "style",
       });
     }
     const lower = s.toLowerCase().replace(/’/g, "'");
     const banned = BANNED_PHRASES.find((p) => lower.includes(p));
-    if (banned) findings.push({ quote: s, problem: `Uses the banned filler "${banned}".` });
+    if (banned) findings.push({ quote: s, problem: `Uses the banned filler "${banned}".`, severity: "style" });
     for (const re of SPECIFICS) {
       for (const m of s.matchAll(re)) {
         if (!isSupported(m[0], allowed)) {
           findings.push({
             quote: s,
             problem: `"${m[0]}" isn't in the brief or source material. Remove it or use a [placeholder].`,
+            severity: "serious",
           });
         }
       }
@@ -219,20 +224,22 @@ export function runChecks(content: string, ctx: CheckContext): Finding[] {
 
   for (const r of ctx.removed) {
     if (normalizeText(r).length >= 20 && findSpanLoose(content, r)) {
-      findings.push({ quote: r, problem: "The user removed this text; it must not come back." });
+      findings.push({ quote: r, problem: "The user removed this text; it must not come back.", severity: "serious" });
     }
   }
 
   for (const s of sents) {
     if (isUsersOwn(s)) continue;
     const plainS = squash(s);
-    // Framed as an aim ("built to cut no-shows by 50%") is fine; stated as fact is not.
-    if (!/\b(goal|aim|designed|built to|target|help)/i.test(s)) {
+    // Framed as an aim ("built to cut no-shows by 50%") is fine; stated as fact is not, and
+    // "reminders help cut no-shows by 50%" is still a stated result.
+    if (!/\b(goal|aim|designed|built to|target)/i.test(s)) {
       for (const token of ctx.goalTokens ?? []) {
         if (plainS.includes(squash(token))) {
           findings.push({
             quote: s,
             problem: `"${token}" is a goal in the source, not a proven result. Don't state it as fact: say what the product is built to do, or remove the number.`,
+            severity: "serious",
           });
         }
       }
@@ -243,6 +250,7 @@ export function runChecks(content: string, ctx: CheckContext): Finding[] {
         findings.push({
           quote: s,
           problem: `"${item}" is out of scope in the source. Don't mention it or promise it; remove this.`,
+          severity: "serious",
         });
       }
     }
@@ -251,20 +259,34 @@ export function runChecks(content: string, ctx: CheckContext): Finding[] {
   const docLower = normalizeText(content).toLowerCase();
   for (const k of ctx.keep) {
     if (!docLower.includes(normalizeText(k).toLowerCase())) {
-      findings.push({ problem: `The user's own line is missing and must appear word for word: "${k}"` });
+      findings.push({
+        problem: `The user's own line is missing and must appear word for word: "${k}"`,
+        severity: "serious",
+      });
     }
+  }
+
+  // A heading with nothing under it (seen in a shipped landing page).
+  for (const m of content.matchAll(/^(#{1,6}\s.+?)\s*\n+(?=#{1,6}\s|\s*$(?![\s\S]))/gm)) {
+    findings.push({
+      quote: m[1].trim(),
+      problem: "This section has a heading but no text under it.",
+      severity: "serious",
+    });
   }
 
   const short = sents.filter((s) => words(s).length <= TARGET_SENTENCE_WORDS).length;
   if (sents.length >= 5 && short / sents.length < 0.6) {
     findings.push({
       problem: `Only ${Math.round((100 * short) / sents.length)}% of sentences are ${TARGET_SENTENCE_WORDS} words or fewer; most should be.`,
+      severity: "style",
     });
   }
   const grade = readingGrade(withoutPlaceholders);
   if (grade >= MAX_GRADE) {
     findings.push({
       problem: `Reading level is about grade ${grade.toFixed(1)}; it must be below ${MAX_GRADE}. Use shorter sentences and plainer words.`,
+      severity: "style",
     });
   }
   return findings;

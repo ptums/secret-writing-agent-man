@@ -97,12 +97,16 @@ export function applyEdit(content: string, find: string, replace: string): EditR
     const nl = content.indexOf("\n", end);
     const lineEnd = nl === -1 ? content.length : nl;
     if (/^[\s*_`]*$/.test(content.slice(end, lineEnd))) end = lineEnd;
+    // Removing the last sentence of a line takes the space before it too ("iOS. Android…").
+    if (end === lineEnd && start > lineStart && content[start - 1] === " ") start--;
   }
 
   // Only whitespace-only lines are cleaned up: trailing double spaces elsewhere are
   // Markdown hard line breaks and must survive.
   const next = (content.slice(0, start) + replace + content.slice(end))
     .replace(/\n[ \t]+(?=\n)/g, "\n")
+    // A sentence removed from the start of a paragraph leaves a leading space behind.
+    .replace(/\n (?=[^\s\-*+\d>#])/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
   return { ok: true, content: next };

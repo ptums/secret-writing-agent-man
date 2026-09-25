@@ -20,30 +20,42 @@ import type { LineOptions } from "@/lib/options";
 import { applyEdit, findSpan, normalizeText } from "@/lib/textEdit";
 import { discussionModel } from "./models";
 import { textToolCallMiddleware } from "./textToolCalls";
-import { NO_GUIDANCE, editDraft, reviseAndEdit, rewordText, type StandingGuidance } from "./editor";
-import { writeContent } from "./writer";
+import { draftWithReview, reviseAndEdit, rewordText, type StandingGuidance } from "./editor";
+import { formatBrief, summarizeConversation } from "./handoff";
 
-const SYSTEM_PROMPT = `You are the account lead for a writing studio. You talk with the user, find their past documents, and hand work to specialists: a writer for new pieces (create_content) and an editor for changes (reword_text, revise_document). You never write marketing copy yourself, not even one line.
+const SYSTEM_PROMPT = `You are the account lead at a small writing studio. You are the only one who talks with the user. Two specialists do the writing, and they never see this conversation:
+- the writer drafts new pieces (create_content)
+- the editor changes existing text (reword_text, revise_document)
+They know only what your tool calls tell them, so every handoff must be complete on its own. You never write copy yourself, not even one line.
 
-How to work:
-- Do only what the latest message asks. "Rename…", "call it…", or "change the title…" means rename_document, never create_content.
-- Only call create_content when the user asks you to write, draft, or create something.
-- If a request to write is missing something essential (what it's for, who it's for), ask one short clarifying question. Otherwise, fill reasonable gaps and call create_content right away.
-- Put everything useful into the brief: product, offer, goal, audience, key points, constraints, and anything the user said earlier in the conversation.
-- Documents the user pastes or links (PRDs, user stories, notes, Google Docs) are saved as this document's source material and passed to the writer word for word. Don't copy them into the brief; the brief says what to write, for whom, and what to emphasize.
+# Handing off new writing: create_content
+- Call it only when the user asks you to write, draft, or create something. When they're just chatting or sharing ideas, reply briefly and naturally without a tool.
+- "request" is one explicit instruction in plain words: what to write, about what, and for whom, plus anything the user asked to include or avoid. Example: "Write an essay about how carb overloading can impact your health."
+- Write the request as an instruction to the writer. Refer to the user as "the user", never "I" or "my": "how I balance my carbs" made the writer produce a first-person piece.
+- A summary of this conversation is attached for the writer automatically. Don't retell the chat in the request; make the request itself unambiguous.
+- If something essential is missing (what it's for, who it's for), ask one short question first. Otherwise fill reasonable gaps and hand off right away.
+- Documents the user pastes or links (PRDs, user stories, notes, Google Docs) are saved as source material and reach the writer word for word. Don't copy them into the request.
 - If the user shares a document without saying what to write, confirm you have it and ask what they want made from it.
 - If a note says a Google Doc couldn't be read, tell the user why and don't write anything from it.
-- Never say you did something unless a tool did it.
-- If this conversation's document is empty, create_content writes into it. Otherwise create_content makes a new document.
-- Choose the tool for a change to the document:
-  - edit_text: the user gives the exact new text ("replace X with Y", "change X to Y", "drop X", "add Y after X"). The new text must be their words, copied from their message. To remove, use an empty "replace". To add a line, find the text it goes after and replace it with that text plus the new line.
-  - reword_text: the user wants a line or sentence reworded or improved without giving the exact new words. This includes "reword this", "suggest another", "I don't like the rest", "keep X", and a part marked with <angle brackets>. Put the phrases they want kept in "keep" and the ones they want gone in "drop", copied from their message. Put what the new wording should convey, in their words, in "direction". The editor writes the wording.
-  - revise_document: broad changes to the whole document or a whole section, like tone, length, or focus.
-- Feedback like "getting closer", "not quite", "I like X", "keep X", or "I don't like the rest" asks for another change, not approval. Call reword_text again, with keep/drop taken from their words.
-- "This", "it", "this bullet", or "this line" usually means the line from the most recent change (see the note under the message). If you can't tell which text they mean, ask one short question.
-- One call per change. Never create a new document for an edit.
+- If this conversation's document is empty, create_content writes into it. Otherwise it makes a new document.
+
+# Handing off changes to the open document
+Choose one tool per change:
+- edit_text: the user gives the exact new text ("replace X with Y", "change X to Y", "drop X", "add Y after X"). The new text must be their words, copied from their message. To remove, use an empty "replace". To add a line, find the text it goes after and replace it with that text plus the new line.
+- reword_text: the user wants a line or sentence reworded or improved without giving the exact new words: "reword this", "suggest another", "I don't like the rest", "keep X", or a part marked with <angle brackets>. Put the phrases they want kept in "keep" and the ones they want gone in "drop", copied from their message. Put what the new wording should convey, in their words, in "direction".
+- revise_document: broad changes to the whole document or a whole section, like tone, length, or focus. "instructions" is one explicit instruction, like a request.
+Feedback like "getting closer", "not quite", or "I like X but…/I don't like the rest" asks for another change, not approval: call reword_text again. Praise on its own ("I like it", "feels like us", "looks good") is not a request: thank them and change nothing.
+"This", "it", "this bullet", or "this line" usually means the line from the most recent change (see the note under the message). If you can't tell which text they mean, ask one short question.
+Never create a new document for an edit.
+
+# Other tools
+- "Rename…", "call it…", or "change the title…" means rename_document, never create_content.
 - To find or show past work ("find", "show me", "open", "where is"), call search_documents first. If several match, list their titles or open the clear best match with open_document. Never guess an id, and never write new content when the user asked to find something.
-- After a tool creates, revises, or opens a document, reply in one sentence. The document and an exact list of changes are already shown to the user; don't describe or repeat them.
+
+# Rules
+- Do only what the latest message asks.
+- Never say you did something unless a tool did it.
+- After a tool creates, changes, or opens a document, reply in one short sentence. The user already sees the document and the exact changes; don't describe or repeat them.
 - Be concise and direct.`;
 
 const NOT_FOUND = (id: string) =>
@@ -65,6 +77,9 @@ type TurnState = {
   options: LineOptions[];
 };
 
+const NOT_A_CHANGE =
+  "The user didn't ask for a change in this message. Don't change the document; reply to what they said.";
+
 const ALREADY_CHANGED =
   "The document was already changed this turn, and the user didn't ask for more. Don't change it again; reply to the user in one short sentence.";
 
@@ -77,6 +92,78 @@ function recentChanges(history: ChatMessage[]) {
       const pick = (sign: string) => lines.filter((l) => l.startsWith(sign)).map((l) => l.slice(2).trim());
       return { removed: pick("−"), added: pick("+") };
     });
+}
+
+// Writing is only handed off when the user's message asks for it. In testing, "I try not to
+// eat too many carbs in one day" (after the agent offered to write) produced a 1,186-word post.
+const WRITE_VERBS =
+  /\b(write|draft|create|compose|make|produce|generate|put together|turn (this|it) into|come up with|redo|rewrite)\b/i;
+const FORMATS =
+  /\b(essay|article|blog|post|email|newsletter|landing page|homepage|website|copy|ad|ads|caption|captions|tagline|headline|brief|script|bio|page|story|piece|announcement|press release|outline)\b/i;
+const YES = /^\s*(yes|yeah|yep|sure|ok(ay)?|please( do)?|go (for it|ahead)|do it|sounds good|let'?s do it)\b/i;
+
+export function asksForWriting(message: string, history: ChatMessage[]) {
+  if (WRITE_VERBS.test(message) && FORMATS.test(message)) return true;
+  if (/\b(write|draft)\b/i.test(message)) return true;
+  // "Yes" right after the agent offered to write something.
+  const lastReply = [...history].reverse().find((m) => m.role === "assistant")?.content ?? "";
+  return YES.test(message) && /\b(write|draft|create)\b/i.test(lastReply);
+}
+
+// Rewrites and rewordings need a change request. "I really like how the hero reads now"
+// produced a rewrite of the hero in testing.
+const CHANGE_WORDS =
+  /\b(make|change|reword|rewrite|rephrase|revise|redo|shorten|lengthen|expand|trim|tighten|cut|drop|remove|delete|add|replace|swap|fix|tweak|improve|adjust|update|simplify|soften|punch(y|ier)?|warmer|cooler|shorter|longer|more|less|different|another|instead|try|suggest|keep|rework|polish|edit)\b/i;
+const DISLIKE =
+  /\b(don'?t like|do not like|not (a fan|great|quite|right)|dislike|hate|getting closer|feels off|weird|awkward|wrong|too (long|short|much|many|formal|casual|wordy|generic|salesy|stiff|vague|busy|dense|cheesy|corporate))\b/i;
+
+export function asksForChange(message: string) {
+  return CHANGE_WORDS.test(message) || DISLIKE.test(message) || /<[^>]+>/.test(message);
+}
+
+// After a rewrite, puts back the user's recent line-level decisions if an older version of
+// the line reappeared. In testing, "make the page warmer" restored two lines the user had
+// just changed. A line the rewrite changed into something new is left alone, and so is a
+// line the user's current message mentions (they may be asking to change it back).
+async function restoreDecisions(content: string, documentId: string, userMessage: string) {
+  const decisions = (await revisionHistory(documentId)).filter((h) => h.find?.trim() && h.replace?.trim());
+  const words = (t: string) =>
+    new Set(
+      normalizeText(t)
+        .toLowerCase()
+        .match(/[a-z0-9’']+/g) ?? [],
+    );
+  const similarity = (a: string, b: string) => {
+    const [wa, wb] = [words(a), words(b)];
+    return [...wa].filter((w) => wb.has(w)).length / Math.max(wa.size, wb.size, 1);
+  };
+  let result = content;
+  for (const d of decisions) {
+    const mentioned = normalizeText(userMessage).toLowerCase().includes(normalizeText(d.find!).toLowerCase());
+    if (mentioned || findSpan(result, d.replace!).ok) continue;
+    const exact = applyEdit(result, d.find!, d.replace!);
+    if (exact.ok) {
+      result = exact.content;
+      continue;
+    }
+    // A cut-down or reworded old version ("We listen. What’s your real problem?"): the line
+    // that starts the same way and is closer to the old wording than to the user's.
+    const lines = result.split("\n");
+    const i = lines.findIndex((line) => {
+      const bare = line.replace(/^\s*(?:[-*+•]|\d+[.)])\s*/, "");
+      return (
+        firstWords(bare) === firstWords(d.find!) &&
+        similarity(bare, d.find!) >= 0.5 &&
+        similarity(bare, d.find!) > similarity(bare, d.replace!)
+      );
+    });
+    if (i !== -1) {
+      const marker = lines[i].match(/^\s*(?:[-*+•]|\d+[.)])\s*/)?.[0] ?? "";
+      lines[i] = marker + d.replace!;
+      result = lines.join("\n");
+    }
+  }
+  return result;
 }
 
 // A replacement is the user's wording if every word in it comes from their message or
@@ -183,6 +270,9 @@ function buildTools(state: TurnState, thread: { doc: Document; userMessage: stri
 
   const createContent = tool(
     async ({ keywords, ...rest }) => {
+      if (!asksForWriting(thread.userMessage, thread.history)) {
+        return "The user didn't ask for anything to be written in this message. Don't write; reply to what they said. You may ask if they'd like something written.";
+      }
       const req = {
         ...rest,
         keywords: keywords
@@ -190,10 +280,21 @@ function buildTools(state: TurnState, thread: { doc: Document; userMessage: stri
           .map((k) => k.trim())
           .filter(Boolean),
       };
-      // Writer drafts; the editor reviews and fixes before anything is saved or shown.
-      const request = { ...req, sourceMaterial };
-      const content = await editDraft(await writeContent(request), { request, guidance: NO_GUIDANCE });
-      const fields = { title: req.title, content, contentType: req.contentType, brief: req.brief, sourceMaterial };
+      // The handoff: the chat agent's explicit request plus a summary of the actual chat.
+      // Stored together as the brief, so the editor sees both on every later revision.
+      const brief = formatBrief(req.request, await summarizeConversation(thread.history, thread.userMessage));
+      console.info("[handoff]", JSON.stringify({ brief }));
+      // Writer drafts; the editor reviews and sends it back until it passes (see draftWithReview).
+      const request = {
+        contentType: req.contentType,
+        brief,
+        audience: req.audience,
+        tone: req.tone,
+        keywords: req.keywords,
+        sourceMaterial,
+      };
+      const content = await draftWithReview(request);
+      const fields = { title: req.title, content, contentType: req.contentType, brief, sourceMaterial };
 
       // A blank document (from the "+" button) is filled in place: it's what this thread is for.
       if (isBlank(thread.doc)) {
@@ -222,9 +323,11 @@ function buildTools(state: TurnState, thread: { doc: Document; userMessage: stri
       schema: z.object({
         title: z.string().describe('Short descriptive name for the document, e.g. "Spring Sale Launch Email"'),
         contentType: z.enum(CONTENT_TYPES),
-        brief: z
+        request: z
           .string()
-          .describe("Complete brief: product/offer, goal, key points, constraints, and relevant context"),
+          .describe(
+            'One explicit instruction: what to write, about what, for whom, and anything to include or avoid. E.g. "Write an essay about how carb overloading can impact your health."',
+          ),
         audience: z.string().optional(),
         tone: z.string().optional(),
         // A comma-separated string rather than an array: small local models often send a string anyway.
@@ -236,15 +339,19 @@ function buildTools(state: TurnState, thread: { doc: Document; userMessage: stri
   const reviseDoc = tool(
     async ({ id, instructions, scope }) => {
       if (state.changedThisTurn) return ALREADY_CHANGED;
+      if (!asksForChange(thread.userMessage)) return NOT_A_CHANGE;
       const current = await getDocument(id);
       if (!current) return NOT_FOUND(id);
       state.revisedThisTurn = true;
       // The editor owns revisions: it rewrites, then reviews its own work like any draft.
+      // The explicit instruction plus the user's own words. No chat summary here: it quoted
+      // earlier versions of lines, and a rewrite restored them over the user's later edits.
       const withUserWords = `${instructions}\nThe user's own words: "${thread.userMessage}"`;
-      const content = await reviseAndEdit(current.content, withUserWords, scope ?? inferScope(instructions), {
+      const rewritten = await reviseAndEdit(current.content, withUserWords, scope ?? inferScope(instructions), {
         request: { contentType: current.contentType, brief: current.brief, sourceMaterial: current.sourceMaterial },
         guidance: await standingGuidance(current),
       });
+      const content = await restoreDecisions(rewritten, id, thread.userMessage);
       await reviseDocument(id, { content }, { kind: "revise", instructions });
       state.documentId = id;
       state.changedThisTurn = true;
@@ -306,6 +413,7 @@ function buildTools(state: TurnState, thread: { doc: Document; userMessage: stri
   const rewordTextTool = tool(
     async ({ find, keep, drop, direction }) => {
       if (state.revisedThisTurn) return ALREADY_CHANGED;
+      if (!asksForChange(thread.userMessage)) return NOT_A_CHANGE;
       const current = await getDocument(thread.doc.id);
       if (!current) return NOT_FOUND(thread.doc.id);
       const found = resolveTarget(current.content, find, thread.userMessage, thread.history);
@@ -371,7 +479,8 @@ function buildTools(state: TurnState, thread: { doc: Document; userMessage: stri
       ]
         .filter(Boolean)
         .join("; ");
-      await reviseDocument(current.id, { content }, { kind: "revise", instructions });
+      // find/replace recorded so a later rewrite can't silently bring the old line back.
+      await reviseDocument(current.id, { content }, { kind: "revise", instructions, find: line, replace: result.best });
       thread.doc = { ...current, content };
       state.documentId = current.id;
       state.changedThisTurn = true;

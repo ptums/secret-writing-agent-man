@@ -12,7 +12,7 @@ import {
   type Finding,
 } from "./editorChecks";
 import { editorModel } from "./models";
-import { describeRequest, stripFence, type WriteRequest } from "./writer";
+import { describeRequest, redraftContent, stripFence, writeContent, type WriteRequest } from "./writer";
 
 // The editor agent. Every first draft and every revision passes through it before the
 // user sees anything. It reviews against EDITOR_CRITERIA (plus the mechanical checks in
@@ -21,11 +21,13 @@ import { describeRequest, stripFence, type WriteRequest } from "./writer";
 
 export const EDITOR_CRITERIA = `A piece passes only if all of these hold:
 
-1. Facts. Every price, number, date, day, time, duration, feature, result, and claim is supported by the brief or source material. Goals, targets, and success metrics are not stated as results. Features listed as out of scope or future are not mentioned as existing. No invented testimonials, statistics, customers, or process details.
+1. Facts. Claims about the user's business, product, or offer (prices, numbers, dates, days, durations, features, results, customers, testimonials, process details) are supported by the brief or source material. Goals, targets, and success metrics are not stated as results. Features listed as out of scope or future are not mentioned as existing. General knowledge (how the body, a market, or a technology works) is fine when it's widely accepted, but no invented statistics, studies, or quotes.
 2. Voice. Logical and poetic. Short sentences in plain, common words, below a 10th grade reading level. No filler or hype ("unlock", "elevate", "leverage", "game-changer", "made with love", "in today's fast-paced world"). Doesn't prescribe a feeling to the reader unless the brief asks for it.
 3. Request. Delivers what was asked, in the requested format and tone, for the right audience. Follows the user's earlier feedback. Keeps the user's own lines word for word, and doesn't bring back text they removed.
 4. Clean. Only the deliverable: no preamble, notes to the user, or section labels (like "Hero" or "Features") used as headings.`;
 
+// Reviews a rewrite of an existing document (see reviseAndEdit). New drafts are reviewed by
+// draftWithReview instead, which sends failing drafts back to the writer.
 const REVIEW_PROMPT = `You are a meticulous copy editor. You don't rewrite pieces; you find specific problems and give exact fixes.
 
 ${EDITOR_CRITERIA}
@@ -35,9 +37,150 @@ For each problem, return:
 - problem: what's wrong, briefly
 - replacement: the corrected text for that quote, in the same voice and plain Markdown (never HTML), or "" to delete it. Never add a number, price, day, or duration that isn't in the brief or source; when one is needed, use a bracketed placeholder like [delivery day].
 
-Only flag real problems against the criteria. Don't restyle text that already passes, and don't remove headings (renaming a vague one is fine).
+Only flag real problems against the criteria. Don't restyle text that already passes, and don't remove headings (renaming a vague one is fine). Prefer fixing a sentence to deleting it; never delete a whole paragraph or section.
 
 Never flag or change the user's own lines. Return an empty list if the piece passes.`;
+
+// ---- Reviewing new drafts ----------------------------------------------------------
+//
+// The writer drafts; the editor scores how well the draft fulfills the request and checks it
+// against EDITOR_CRITERIA (plus the code checks). A draft passes only with high accuracy and
+// nothing flagged; otherwise it goes back to the writer with specific instructions, and the
+// new draft is reviewed again. Nothing here is shown to the user: they see the draft that
+// passed (or the best one, if none did).
+
+export const PASS_ACCURACY = 8;
+const MAX_DRAFTS = 3;
+
+const DRAFT_REVIEW_PROMPT = `You are the editor at a writing studio. The account lead sends the writer a request (and a summary of the conversation with the user); the writer sends you a draft. You decide whether the draft is good enough to show the user.
+
+Judge two things.
+
+1. Accuracy: how well the draft fulfills the request. List the requirements the request sets, 3 to 8 of them: what to write and about what, the format, the audience, anything to include or avoid, and using what the conversation context says about the user. Mark each one met or not met, strictly. Only count requirements the request or context actually states.
+2. The criteria below. Label every problem with the criterion it breaks: Facts, Voice, Request, or Clean.
+
+${EDITOR_CRITERIA}
+
+Facts problems are serious: they send the draft back to the writer. Whether the draft does what was asked is judged by the requirements above, so Request, Voice, and Clean problems are minor: note them, but they don't block a pass.
+A draft passes if at least ${PASS_ACCURACY * 10}% of the requirements are met and there are no Facts problems.
+
+Return:
+- requirements: each requirement and whether the draft meets it
+- problems: each one with the exact quote from the draft, its criterion, and what's wrong
+- instructions: if the draft doesn't pass, specific instructions for the writer's next draft. Refer to exact passages, say what to change and how, and say what to keep. Empty if it passes.`;
+
+const DraftReview = z.object({
+  requirements: z.array(z.object({ requirement: z.string(), met: z.boolean() })),
+  problems: z.array(
+    z.object({ quote: z.string(), criterion: z.enum(["Facts", "Voice", "Request", "Clean"]), problem: z.string() }),
+  ),
+  instructions: z.string(),
+});
+
+type DraftVerdict = {
+  draft: string;
+  accuracy: number;
+  serious: string[];
+  minor: string[];
+  notes: string;
+  passed: boolean;
+};
+
+// Tiered: only unmet requirements, the model's Facts problems, and serious code checks send a
+// draft back. With every flag blocking, no draft passed in testing (an 8B reviewer always
+// finds a nitpick; 6–12 minutes per piece). The model's Request/Clean labels were nitpicks
+// too ("not formatted as a button"), and both are covered better elsewhere: the requirements
+// checklist for the request, the code checks for structure.
+// A model "Facts" flag only blocks when the quote contains something checkable: a number,
+// price, percentage, or a quoted testimonial. Elsewhere it flagged general knowledge in a
+// health essay ("carbs raise blood sugar") and "two loaves" vs "2 loaves" as fact problems.
+const checkable = (quote: string) => /\d|[$%]|["“][^"”]{8,}["”]/.test(quote);
+
+export async function reviewDraft(draft: string, ctx: EditorContext): Promise<DraftVerdict> {
+  // The code checks are flags too: they catch what the model reviewer misses.
+  const findings = runChecks(draft, checkContext(ctx));
+  const review = await editorModel()
+    .withStructuredOutput(DraftReview)
+    .invoke([
+      new SystemMessage(DRAFT_REVIEW_PROMPT),
+      new HumanMessage(`The request:\n${describeRequest(ctx.request)}\n\nThe draft:\n<<<\n${draft}\n>>>`),
+    ]);
+  const describe = (quote: string | undefined, problem: string) => (quote ? `"${quote}": ${problem}` : problem);
+  const serious = [
+    ...review.problems
+      .filter((p) => p.criterion === "Facts" && checkable(p.quote))
+      .map((p) => describe(p.quote, `${p.problem} (Facts)`)),
+    ...findings.filter((f) => f.severity === "serious").map((f) => describe(f.quote, f.problem)),
+  ];
+  const minor = [
+    ...review.problems
+      .filter((p) => p.criterion !== "Facts" || !checkable(p.quote))
+      .map((p) => describe(p.quote, p.problem)),
+    ...findings.filter((f) => f.severity === "style").map((f) => describe(f.quote, f.problem)),
+  ];
+  // Accuracy is the share of the request's requirements met: a 1–10 gut score from the model
+  // came back 9–10 for every draft in testing, so it couldn't tell drafts apart (this scores
+  // a matching draft 10/10 and an off-topic one 0/10).
+  if (process.env.DEBUG_EDITOR) console.info(`[editor] serious:\n${serious.join("\n")}`);
+  const met = review.requirements.filter((q) => q.met).length;
+  const accuracy = review.requirements.length ? Math.round((10 * met) / review.requirements.length) : 10;
+  const unmet = review.requirements.filter((q) => !q.met).map((q) => q.requirement);
+  const list = (items: string[]) => items.map((i) => `- ${i}`).join("\n");
+  const notes = [
+    unmet.length && `Requirements the draft doesn't meet yet:\n${list(unmet)}`,
+    serious.length && `Must fix:\n${list(serious)}`,
+    review.instructions && `Instructions: ${review.instructions}`,
+    minor.length && `Also improve if you can:\n${list(minor)}`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  return { draft, accuracy, serious, minor, notes, passed: accuracy >= PASS_ACCURACY && !serious.length };
+}
+
+// Writer drafts → editor reviews → writer redrafts with the editor's notes, until a draft
+// passes or MAX_DRAFTS is reached; then the best draft wins.
+export async function draftWithReview(request: WriteRequest) {
+  const ctx: EditorContext = { request, guidance: NO_GUIDANCE };
+  const verdicts: DraftVerdict[] = [];
+  let draft = await writeContent(request);
+  for (let n = 1; n <= MAX_DRAFTS; n++) {
+    const verdict = await reviewDraft(draft, ctx);
+    verdicts.push(verdict);
+    console.info(
+      `[editor] draft ${n}: accuracy ${verdict.accuracy}/10, ${verdict.serious.length} serious / ${verdict.minor.length} minor → ${verdict.passed ? "pass" : n < MAX_DRAFTS ? "back to the writer" : "out of drafts"}`,
+    );
+    if (verdict.passed || n === MAX_DRAFTS) break;
+    draft = await redraftContent(request, verdict.notes);
+  }
+  // Best = a passing draft if any; else most accurate, then fewest serious, then fewest minor.
+  const rank = (v: DraftVerdict) => [v.passed ? 1 : 0, v.accuracy, -v.serious.length, -v.minor.length];
+  const better = (a: DraftVerdict, b: DraftVerdict) => {
+    const [ra, rb] = [rank(a), rank(b)];
+    const i = ra.findIndex((x, k) => x !== rb[k]);
+    return i === -1 ? b : ra[i] > rb[i] ? a : b; // ties go to the later draft
+  };
+  const best = verdicts.reduce(better);
+  const checks = checkContext(ctx);
+  return removeOutOfScope(confirmUnsupported(best.draft, checks), checks).replace(/^(#{1,6})(?=[^\s#])/gm, "$1 ");
+}
+
+// Safety net after the last draft: a sentence mentioning something the source lists as out of
+// scope doesn't ship ("Android is coming." survived three drafts in testing), and neither do
+// leaked section labels used as headings.
+function removeOutOfScope(content: string, checks: ReturnType<typeof checkContext>) {
+  // Section labels used as headings ("# Hero", "## Final CTA") carry no content; drop them.
+  let result = content
+    .split("\n")
+    .filter((line) => !LITERAL_HEADINGS.test(line.trim()))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n");
+  for (const f of runChecks(content, checks)) {
+    if (!f.quote || !/is out of scope in the source/.test(f.problem)) continue;
+    const removed = applyEdit(result, f.quote, "");
+    if (removed.ok) result = removed.content;
+  }
+  return result;
+}
 
 // What the user has already decided about this document, so later work doesn't undo it.
 export type StandingGuidance = {
@@ -56,6 +199,21 @@ export type EditorContext = {
 };
 
 const MAX_ROUNDS = 2;
+// A review that wants dozens of changes is nitpicking; take the first ones.
+const MAX_FIXES_PER_ROUND = 12;
+// A round that empties a section or cuts this share of the words is discarded: in testing,
+// one round deleted 42 sentences of an essay and left bare headings.
+const MAX_ROUND_CUT = 0.2;
+
+const wordCount = (t: string) => t.split(/\s+/).filter(Boolean).length;
+
+// A heading followed directly by another heading (or the end) that had text in `before`.
+function emptiedSection(before: string, after: string) {
+  const empty = (t: string) =>
+    [...t.matchAll(/^(#{1,6}\s.+)\n+(?=#{1,6}\s|$(?![\s\S]))/gm)].map((m) => normalizeText(m[1]));
+  const wasEmpty = new Set(empty(before));
+  return empty(after).some((h) => !wasEmpty.has(h));
+}
 
 const Review = z.object({
   issues: z.array(z.object({ quote: z.string(), problem: z.string(), replacement: z.string() })),
@@ -126,7 +284,8 @@ export async function editDraft(draft: string, ctx: EditorContext) {
     // still flag: a second open-ended review mostly restyled copy that already passed
     // (and deleted a correct feature line in testing).
     if (round > 1 && findings.length === 0) break;
-    const issues = await review(content, ctx, findings);
+    const issues = (await review(content, ctx, findings)).slice(0, MAX_FIXES_PER_ROUND);
+    const roundStart = content;
     let applied = 0;
     for (const issue of issues) {
       if (normalizeText(issue.quote) === normalizeText(issue.replacement)) continue; // whitespace-only "fix"
@@ -139,6 +298,11 @@ export async function editDraft(draft: string, ctx: EditorContext) {
         content = result.content;
         applied++;
       }
+    }
+    if (wordCount(content) < wordCount(roundStart) * (1 - MAX_ROUND_CUT) || emptiedSection(roundStart, content)) {
+      console.info(`[editor] round ${round}: discarded (cut too much)`);
+      content = roundStart;
+      break;
     }
     console.info(
       `[editor] round ${round}: ${findings.length} check findings, ${issues.length} issues, ${applied} fixed`,
@@ -217,16 +381,20 @@ export async function reviseAndEdit(
   };
   const unchanged = (text: string) => text.trim() === currentContent.trim();
 
-  let revised = await rewrite(prompt(currentContent, { source: scope === "part" }), 0.4);
-  if (unchanged(revised)) {
-    revised = await rewrite(
-      prompt(currentContent, { extra: "Your previous attempt returned the document unchanged. Apply the change." }),
-      0.7,
-    );
-  }
-  if (unchanged(revised) && scope === "whole") {
-    const bySection = await rewriteBySection(currentContent, instructions);
+  // Whole-document changes go section by section: in one pass, qwen3:8b echoed, restored
+  // old versions of edited lines, and copied one list item's text into the next.
+  let revised = currentContent;
+  if (scope === "whole") {
+    const bySection = await rewriteBySection(currentContent, instructions, ctx.guidance.keep);
     if (!isMalformed(bySection, currentContent)) revised = bySection;
+  } else {
+    revised = await rewrite(prompt(currentContent, { source: true }), 0.4);
+    if (unchanged(revised)) {
+      revised = await rewrite(
+        prompt(currentContent, { extra: "Your previous attempt returned the document unchanged. Apply the change." }),
+        0.7,
+      );
+    }
   }
   if (unchanged(revised)) return currentContent; // reported upstream as "no changes"
   return editDraft(revised, { ...ctx, instructions });
@@ -234,23 +402,48 @@ export async function reviseAndEdit(
 
 const headingCount = (text: string) => (text.match(/^#{1,6}\s/gm) ?? []).length;
 
+// Lines (normalized) that appear more than once.
+function duplicateLines(text: string) {
+  const seen = new Map<string, number>();
+  for (const line of text.split("\n")) {
+    const n = normalizeText(line.replace(/^\s*(?:[-*+•]|\d+[.)]|#{1,6})\s*/, "")).toLowerCase();
+    if (n.length > 20) seen.set(n, (seen.get(n) ?? 0) + 1);
+  }
+  return new Set([...seen].filter(([, count]) => count > 1).map(([line]) => line));
+}
+
+// Rewrites that repeat sections (10 headings from 5), balloon, or copy one line's text into
+// another ("We build. A clear, actionable roadmap…" from step 2) are failed attempts.
 function isMalformed(revised: string, original: string) {
-  return headingCount(revised) > headingCount(original) + 1 || revised.length > original.length * 1.8;
+  const before = duplicateLines(original);
+  const newDuplicates = [...duplicateLines(revised)].some((line) => !before.has(line));
+  return headingCount(revised) > headingCount(original) + 1 || revised.length > original.length * 1.8 || newDuplicates;
 }
 
 // Last resort for whole-document changes: smaller pieces echo far less (5/6 sections
 // changed where whole-document attempts had echoed).
-async function rewriteBySection(content: string, instructions: string) {
+async function rewriteBySection(content: string, instructions: string, keep: string[]) {
   const sections = content.split(/\n(?=#{1,6}\s)/);
   const rewritten = [];
   for (const section of sections) {
+    // The user's own lines in this section stay word for word.
+    const own = keep.filter((k) => findSpan(section, k).ok);
     const response = await editorModel({ temperature: 0.5 }).invoke([
       new HumanMessage(
-        `This is one section of a longer piece:\n<<<\n${section}\n>>>\n\nRewrite this section: ${instructions} Keep its heading, facts, and meaning. Return only the rewritten section in Markdown.`,
+        [
+          `This is one section of a longer piece:\n<<<\n${section}\n>>>`,
+          `Rewrite this section: ${instructions}`,
+          "Keep its heading, facts, meaning, and list structure. Each line must stay distinct: don't copy one item's words into another.",
+          own.length && `Keep these lines word for word: ${own.map((o) => `"${o}"`).join("; ")}`,
+          "Return only the rewritten section in Markdown.",
+        ]
+          .filter(Boolean)
+          .join("\n"),
       ),
     ]);
     const out = stripFence(response.text);
-    rewritten.push(out && headingCount(out) <= headingCount(section) ? out : section);
+    const ok = out && headingCount(out) <= headingCount(section) && !isMalformed(out, section);
+    rewritten.push(ok ? out : section);
   }
   return rewritten.join("\n\n");
 }
